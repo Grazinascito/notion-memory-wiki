@@ -99,8 +99,8 @@ function printHelp(): void {
       "  wiki catalog [--area <id>] [--profile <name>]      List permitted databases (Level 1a)",
       "  wiki query <alias> [--where K=V] [--fields a,b] [--follow <rel>] [--limit 20] [--profile <name>]",
       "  wiki read <page-id-url-or-alias> [--full] [--offset N] [--profile <name>]",
-      "  wiki write create <alias> --set K=V [--md \"...\"] [--profile <name>]",
-      "  wiki write update <page-id> [--set K=V] [--add K=V] [--remove K=V] [--clear K] [--profile <name>]",
+      "  wiki write create <alias> --set K=V [--md \"...\"] [--propose-new-option] [--profile <name>]",
+      "  wiki write update <page-id> [--set K=V] [--add K=V] [--remove K=V] [--clear K] [--propose-new-option] [--profile <name>]",
       "  wiki write append <page-id> --md \"...\" [--profile <name>]",
       "  wiki write replace <page-id> --md \"...\" [--profile <name>]   (halted into proposal)",
       "  wiki write trash <page-id> [--profile <name>]                (halted into proposal)",
@@ -414,7 +414,6 @@ async function run(): Promise<void> {
     if (parsed.command === "write") {
       await handleWriteCommand({
         app,
-        ontology,
         profileName,
         tokenRef: scope.token_ref,
         positionals: parsed.positionals,
@@ -434,7 +433,6 @@ async function run(): Promise<void> {
     if (parsed.command === "schema") {
       await handleSchemaCommand({
         app,
-        ontology,
         profileName,
         tokenRef: scope.token_ref,
         positionals: parsed.positionals,

@@ -264,6 +264,7 @@ export class ScopeGuard {
     notion: NotionGateway,
     profileName: string,
     targetId: string,
+    options?: { bypassCache?: boolean },
   ): Promise<void> {
     const scope = ontology.agent_scopes[profileName];
     if (!scope) {
@@ -356,7 +357,7 @@ export class ScopeGuard {
 
     if (
       knownAllowedIds.has(targetId) ||
-      this.verifiedInRoot.has(scopeCacheKey(profileName, targetId))
+      (!options?.bypassCache && this.verifiedInRoot.has(scopeCacheKey(profileName, targetId)))
     ) {
       return;
     }

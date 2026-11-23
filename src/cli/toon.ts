@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import type { ApprovalExecutionResult } from "../core/approval/approval-gate.js";
 import type { CatalogEntry } from "../core/ontology/ontology-engine.js";
 import type { QueryDatabaseResult, ReadPageResult } from "../core/query/query-service.js";
@@ -9,6 +10,7 @@ import type {
   ProposalCreatedResult,
   UpdateRecordResult,
 } from "../core/write/write-service.js";
+import { sanitizeNotionUris, wrapUntrustedContent } from "../shared/text.js";
 
 /**
  * Compact TOON (Token-Oriented Object Notation) formatters for AXI CLI output.
@@ -82,12 +84,16 @@ export function formatCreateToon(res: CreateRecordResult): string {
 
 export function formatProposalToon(res: ProposalCreatedResult, reasons: string[] = []): string {
   const p = res.proposal;
+  const nonce = crypto.randomBytes(8).toString("hex");
+  const sanitizedBlock = sanitizeNotionUris(
+    [`summary: ${p.summary}`, "diff:", p.diff].join("\n"),
+  );
   const lines = [
     `PROPOSAL_REQUIRED proposal_id=${p.proposal_id} category=${p.category} action=${p.action_type} expires=${p.expires_at} calls=${res.apiCalls}`,
-    `  summary: ${p.summary}`,
-    ...(reasons.length > 0 ? [`  reasons: ${reasons.join("; ")}`] : []),
-    "  diff:",
-    p.diff,
+    ...(reasons.length > 0
+      ? [`  reasons: ${reasons.map((r) => sanitizeNotionUris(r)).join("; ")}`]
+      : []),
+    wrapUntrustedContent(sanitizedBlock, nonce),
     `  approve: run \`wiki approve ${p.proposal_id}\` in your terminal`,
   ];
   return lines.join("\n");
@@ -108,5 +114,10 @@ export function formatAppendToon(res: AppendMarkdownResult): string {
 }
 
 export function formatApproveToon(res: ApprovalExecutionResult): string {
-  return `approve ok proposal_id=${res.proposalId} category=${res.category} action=${res.actionType} target=${res.targetId}\n  summary: ${res.summary}`;
+  const nonce = crypto.randomBytes(8).toString("hex");
+  const wrappedSummary = wrapUntrustedContent(
+    sanitizeNotionUris(`summary: ${res.summary}`),
+    nonce,
+  );
+  return `approve ok proposal_id=${res.proposalId} category=${res.category} action=${res.actionType} target=${res.targetId}\n${wrappedSummary}`;
 }

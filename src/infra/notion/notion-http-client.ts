@@ -12,6 +12,7 @@ import type {
   NotionListResponse,
   NotionMarkdownResponse,
   NotionPage,
+  NotionPagePropertyItem,
   NotionView,
 } from "../../shared/types.js";
 
@@ -205,6 +206,21 @@ export class NotionHttpClient implements NotionGateway {
       method: "GET",
       path: `/v1/pages/${encodeURIComponent(pageId)}`,
       endpointKey: "pages-get",
+      isWrite: false,
+    });
+  }
+
+  async listPagePropertyItems(
+    pageId: string,
+    propertyId: string,
+    startCursor?: string,
+  ): Promise<NotionListResponse<NotionPagePropertyItem>> {
+    const qs = new URLSearchParams({ page_size: "100" });
+    if (startCursor) qs.set("start_cursor", startCursor);
+    return this.request({
+      method: "GET",
+      path: `/v1/pages/${encodeURIComponent(pageId)}/properties/${encodeURIComponent(propertyId)}?${qs.toString()}`,
+      endpointKey: "pages-property-items",
       isWrite: false,
     });
   }

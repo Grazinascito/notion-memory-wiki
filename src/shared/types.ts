@@ -355,9 +355,17 @@ export interface NotionPage {
   id: string;
   url?: string;
   parent: NotionParent;
+  created_time?: string;
   last_edited_time: string;
   in_trash?: boolean;
   properties: Record<string, NotionPropertyValue>;
+}
+
+export interface NotionPagePropertyItem {
+  object?: "property_item";
+  id?: string;
+  type: string;
+  relation?: { id: string };
 }
 
 export interface NotionBlock {
@@ -436,7 +444,7 @@ export type ProposalPayload =
       property_name: string;
       property_type: "select" | "multi_select";
       new_option: string;
-      all_options: Array<{ name: string }>;
+      all_options: Array<{ id?: string; name: string; color?: string }>;
     };
 
 export interface ProposalRecord {

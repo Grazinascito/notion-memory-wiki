@@ -162,6 +162,10 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
             },
           };
         },
+        listPagePropertyItems: async () => {
+          calls += 1;
+          return { object: "list", results: [], has_more: false, next_cursor: null };
+        },
         getDataSource: async (id) => {
           calls += 1;
           return {
@@ -651,6 +655,10 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
             properties: {},
           };
         },
+        listPagePropertyItems: async () => {
+          calls += 1;
+          return { object: "list", results: [], has_more: false, next_cursor: null };
+        },
         getDataSource: async (id) => {
           calls += 1;
           return {
@@ -863,6 +871,41 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
       } else {
         process.env.NOTION_TOKEN = prevEnv;
       }
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("requests GET /v1/pages/:pageId/properties/:propertyId?page_size=100 in NotionHttpClient.listPagePropertyItems", async () => {
+    const dir = await makeTempDir();
+    try {
+      const limiter = new CrossProcessRateLimiter({ wikiHome: dir });
+      const requestedUrls: Array<{ url: string; method: string }> = [];
+      const client = new NotionHttpClient({
+        token: "test_token_000",
+        rateLimiter: limiter,
+        fetchFn: async (input, init) => {
+          requestedUrls.push({ url: String(input), method: init?.method ?? "GET" });
+          return new Response(
+            JSON.stringify({
+              object: "list",
+              results: [{ object: "property_item", type: "relation", relation: { id: "rel-1" } }],
+              has_more: false,
+              next_cursor: null,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        },
+      });
+
+      const res = await client.listPagePropertyItems("page-123", "prop-abc", "cur-2");
+      assert.equal(res.results.length, 1);
+      assert.equal(requestedUrls.length, 1);
+      assert.equal(requestedUrls[0]!.method, "GET");
+      assert.equal(
+        requestedUrls[0]!.url,
+        "https://api.notion.com/v1/pages/page-123/properties/prop-abc?page_size=100&start_cursor=cur-2",
+      );
+    } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
   });

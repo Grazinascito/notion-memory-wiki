@@ -8,6 +8,7 @@ import type {
   NotionListResponse,
   NotionMarkdownResponse,
   NotionPage,
+  NotionPagePropertyItem,
   NotionView,
   OntologyConfig,
   ProposalRecord,
@@ -33,6 +34,11 @@ export interface NotionGateway {
   getCallCount(): number;
   getMe(): Promise<{ id: string; name?: string; type: string }>;
   getPage(pageId: string): Promise<NotionPage>;
+  listPagePropertyItems(
+    pageId: string,
+    propertyId: string,
+    startCursor?: string,
+  ): Promise<NotionListResponse<NotionPagePropertyItem>>;
   getDatabase(databaseId: string): Promise<NotionDatabase>;
   getDataSource(dataSourceId: string): Promise<NotionDataSource>;
   listBlockChildren(
@@ -103,7 +109,7 @@ export interface MetadataStore {
   fileExists(filePath: string): Promise<boolean>;
   writeProposal(proposal: ProposalRecord): Promise<void>;
   readProposal(proposalId: string): Promise<ProposalRecord>;
-  listProposals(): Promise<ProposalRecord[]>;
+  withProposalLock<T>(proposalId: string, fn: () => Promise<T>): Promise<T>;
 }
 
 export interface RateLimiter {

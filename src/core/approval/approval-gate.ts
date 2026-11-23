@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 import { AxiError } from "../../shared/errors.js";
 import type {
+  NotionDataSource,
+  NotionPage,
   ProposalActionType,
   ProposalCategory,
   ProposalPayload,
@@ -55,6 +57,24 @@ function canonicalize(value: unknown): unknown {
 export function computeContentHash(value: unknown): string {
   const serialized = JSON.stringify(canonicalize(value));
   return crypto.createHash("sha256").update(serialized).digest("hex");
+}
+
+export function hashPageState(
+  page: Pick<NotionPage, "parent" | "in_trash" | "properties">,
+): string {
+  return computeContentHash({
+    parent: page.parent,
+    in_trash: Boolean(page.in_trash),
+    properties: page.properties,
+  });
+}
+
+export function hashMarkdown(markdown: string): string {
+  return computeContentHash({ markdown });
+}
+
+export function hashDataSourceSchema(ds: Pick<NotionDataSource, "properties">): string {
+  return computeContentHash({ properties: ds.properties });
 }
 
 /**
@@ -187,100 +207,98 @@ export class ApprovalGate {
    * and recomputing SHA-256 content hash against live Notion state.
    */
   async approveProposal(proposalId: string): Promise<ApprovalExecutionResult> {
-    const proposal = await this.store.readProposal(proposalId);
+    return this.store.withProposalLock(proposalId, async () => {
+      const proposal = await this.store.readProposal(proposalId);
 
-    if (proposal.status !== "pending") {
-      throw new AxiError(
-        "VALIDATION_ERROR",
-        `Proposal "${proposalId}" is already "${proposal.status}".`,
-      );
-    }
-    if (Date.now() > Date.parse(proposal.expires_at)) {
-      proposal.status = "expired";
-      await this.store.writeProposal(proposal);
-      throw new AxiError(
-        "CONFLICT_STALE_TARGET",
-        `Proposal "${proposalId}" expired at ${proposal.expires_at}. Re-run the write command to create a fresh proposal.`,
-      );
-    }
-
-    const payload = proposal.payload;
-
-    if (
-      payload.kind === "update_properties" ||
-      payload.kind === "trash_page" ||
-      payload.kind === "move_page"
-    ) {
-      const livePage = await this.notion.getPage(payload.page_id);
-      const liveHash = computeContentHash({
-        parent: livePage.parent,
-        in_trash: Boolean(livePage.in_trash),
-        properties: livePage.properties,
-      });
-      if (liveHash !== proposal.expected_content_hash) {
+      if (proposal.status !== "pending") {
+        throw new AxiError(
+          "VALIDATION_ERROR",
+          `Proposal "${proposalId}" is already "${proposal.status}".`,
+        );
+      }
+      if (Date.now() > Date.parse(proposal.expires_at)) {
+        proposal.status = "expired";
+        await this.store.writeProposal(proposal);
         throw new AxiError(
           "CONFLICT_STALE_TARGET",
-          `Target page "${payload.page_id}" changed in Notion after proposal "${proposalId}" was created (content hash mismatch).`,
-          ["Re-read the page and re-generate the proposal before approving."],
+          `Proposal "${proposalId}" expired at ${proposal.expires_at}. Re-run the write command to create a fresh proposal.`,
         );
       }
 
-      if (payload.kind === "update_properties") {
-        await this.notion.updatePageProperties(payload.page_id, payload.properties);
-      } else if (payload.kind === "trash_page") {
-        await this.notion.trashPage(payload.page_id);
-      } else {
-        await this.notion.movePage(payload.page_id, payload.parent);
-      }
-    } else if (payload.kind === "replace_markdown") {
-      const liveMd = await this.notion.getPageMarkdown(payload.page_id);
-      const liveHash = computeContentHash({ markdown: liveMd.markdown });
-      if (liveHash !== proposal.expected_content_hash) {
-        throw new AxiError(
-          "CONFLICT_STALE_TARGET",
-          `Target page "${payload.page_id}" Markdown changed in Notion after proposal "${proposalId}" was created.`,
-          ["Re-read the page and re-generate the proposal before approving."],
-        );
-      }
+      const payload = proposal.payload;
 
-      await this.notion.patchPageMarkdown(payload.page_id, {
-        type: "replace_content",
-        replace_content: {
-          new_str: payload.new_str,
-          allow_deleting_content: payload.allow_deleting_content,
-        },
-      });
-    } else if (payload.kind === "schema_add_option") {
-      const liveDs = await this.notion.getDataSource(payload.data_source_id);
-      const liveHash = computeContentHash({ properties: liveDs.properties });
-      if (liveHash !== proposal.expected_content_hash) {
-        throw new AxiError(
-          "CONFLICT_STALE_TARGET",
-          `Target data source "${payload.data_source_id}" schema changed in Notion after proposal "${proposalId}" was created.`,
-          ["Run `wiki sync` and re-generate the schema proposal."],
-        );
-      }
+      if (
+        payload.kind === "update_properties" ||
+        payload.kind === "trash_page" ||
+        payload.kind === "move_page"
+      ) {
+        const livePage = await this.notion.getPage(payload.page_id);
+        const liveHash = hashPageState(livePage);
+        if (liveHash !== proposal.expected_content_hash) {
+          throw new AxiError(
+            "CONFLICT_STALE_TARGET",
+            `Target page "${payload.page_id}" changed in Notion after proposal "${proposalId}" was created (content hash mismatch).`,
+            ["Re-read the page and re-generate the proposal before approving."],
+          );
+        }
 
-      await this.notion.updateDataSource(payload.data_source_id, {
-        properties: {
-          [payload.property_name]: {
-            [payload.property_type]: {
-              options: payload.all_options,
+        if (payload.kind === "update_properties") {
+          await this.notion.updatePageProperties(payload.page_id, payload.properties);
+        } else if (payload.kind === "trash_page") {
+          await this.notion.trashPage(payload.page_id);
+        } else {
+          await this.notion.movePage(payload.page_id, payload.parent);
+        }
+      } else if (payload.kind === "replace_markdown") {
+        const liveMd = await this.notion.getPageMarkdown(payload.page_id);
+        const liveHash = hashMarkdown(liveMd.markdown);
+        if (liveHash !== proposal.expected_content_hash) {
+          throw new AxiError(
+            "CONFLICT_STALE_TARGET",
+            `Target page "${payload.page_id}" Markdown changed in Notion after proposal "${proposalId}" was created.`,
+            ["Re-read the page and re-generate the proposal before approving."],
+          );
+        }
+
+        await this.notion.patchPageMarkdown(payload.page_id, {
+          type: "replace_content",
+          replace_content: {
+            new_str: payload.new_str,
+            allow_deleting_content: payload.allow_deleting_content,
+          },
+        });
+      } else if (payload.kind === "schema_add_option") {
+        const liveDs = await this.notion.getDataSource(payload.data_source_id);
+        const liveHash = hashDataSourceSchema(liveDs);
+        if (liveHash !== proposal.expected_content_hash) {
+          throw new AxiError(
+            "CONFLICT_STALE_TARGET",
+            `Target data source "${payload.data_source_id}" schema changed in Notion after proposal "${proposalId}" was created.`,
+            ["Run `wiki sync` and re-generate the schema proposal."],
+          );
+        }
+
+        await this.notion.updateDataSource(payload.data_source_id, {
+          properties: {
+            [payload.property_name]: {
+              [payload.property_type]: {
+                options: payload.all_options,
+              },
             },
           },
-        },
-      });
-    }
+        });
+      }
 
-    proposal.status = "applied";
-    await this.store.writeProposal(proposal);
+      proposal.status = "applied";
+      await this.store.writeProposal(proposal);
 
-    return {
-      proposalId: proposal.proposal_id,
-      category: proposal.category,
-      actionType: proposal.action_type,
-      targetId: proposal.target_id,
-      summary: proposal.summary,
-    };
+      return {
+        proposalId: proposal.proposal_id,
+        category: proposal.category,
+        actionType: proposal.action_type,
+        targetId: proposal.target_id,
+        summary: proposal.summary,
+      };
+    });
   }
 }

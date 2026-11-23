@@ -1,5 +1,5 @@
 import { AxiError } from "../../shared/errors.js";
-import { extractNotionUuid, normalizeNfd } from "../../shared/text.js";
+import { normalizeNfd } from "../../shared/text.js";
 import type {
   CachedDataSource,
   CachedProperty,
@@ -15,32 +15,31 @@ import {
   formatNotionPropertyValue,
   toCachedDataSource,
 } from "../sync/notion-mapper.js";
+import {
+  assertRelationTargetAllowed,
+  buildClearPayload,
+  buildSetPayload,
+  extractCurrentList,
+  type MutationOp,
+  type NotionWritePropertyPayload,
+  parseRelationUuid,
+  SchemaDriftError,
+  snapValidOption,
+  UnknownOptionError,
+  type ValidatedPropertyChange,
+} from "./property-payload-builder.js";
 
-export type MutationOp = "set" | "add" | "remove" | "clear";
-
-/**
- * Internal marker error for validation failures that could be caused by stale
- * cached schemas (unknown property or unknown/missing select/status option),
- * triggering at most one reactive refresh of that single data_source_id.
- */
-class SchemaDriftError extends AxiError {}
+export {
+  type MutationOp,
+  type NotionWritePropertyPayload,
+  UnknownOptionError,
+  type ValidatedPropertyChange,
+};
 
 export interface RawPropertyMutation {
   op: MutationOp;
   property: string;
   value?: string;
-}
-
-export interface ValidatedPropertyChange {
-  op: MutationOp;
-  schema: CachedProperty;
-  rawInputValue?: string;
-  notionPayload: Record<string, unknown>;
-  /** For relation / multi_select: exact item lists before and after mutation. */
-  previousItems?: string[];
-  nextItems?: string[];
-  previousFormatted?: string;
-  nextFormatted?: string;
 }
 
 export interface ValidationResult {
@@ -50,6 +49,8 @@ export interface ValidationResult {
   titleValue?: string;
 }
 
+const OPTION_FIELD_TYPES = new Set(["select", "multi_select", "status"]);
+
 export class WriteValidator {
   constructor(
     private readonly notion: NotionGateway,
@@ -57,12 +58,19 @@ export class WriteValidator {
     private readonly scopeGuard: ScopeGuard,
   ) {}
 
+  async refreshDataSourceSchema(
+    ontology: OntologyConfig,
+    dataSourceId: string,
+  ): Promise<CachedDataSource> {
+    return this.loadDataSourceSchema(ontology, dataSourceId, true);
+  }
+
   private async loadDataSourceSchema(
     ontology: OntologyConfig,
     dataSourceId: string,
     forceRefresh: boolean,
   ): Promise<CachedDataSource> {
-    let cache = await this.store.readCache();
+    const cache = await this.store.readCache();
     let cachedDs = cache?.data_sources[dataSourceId];
     if (!forceRefresh && cachedDs) return cachedDs;
 
@@ -102,46 +110,204 @@ export class WriteValidator {
     );
   }
 
-  private extractCurrentList(prop: NotionPropertyValue | undefined): string[] {
-    if (!prop) return [];
-    if (prop.type === "multi_select") {
-      return (prop.multi_select ?? []).map((o) => o.name);
-    }
-    if (prop.type === "relation") {
-      return (prop.relation ?? []).map((r) => r.id);
-    }
-    return [];
+  private findCurrentProperty(
+    currentPage: NotionPage | undefined,
+    schema: CachedProperty,
+  ): NotionPropertyValue | undefined {
+    if (!currentPage) return undefined;
+    return (
+      currentPage.properties[schema.name] ??
+      Object.values(currentPage.properties).find((p) => p.id === schema.id)
+    );
   }
 
-  private snapValidOption(
-    alias: string,
-    schema: CachedProperty,
-    rawVal: string,
-  ): string {
-    const options = schema.options ?? [];
-    if (options.length === 0) {
-      throw new SchemaDriftError(
-        "VALIDATION_ERROR",
-        `Field "${schema.name}" (${schema.type}) has no known options in schema for "${alias}".`,
-        [`Run \`wiki sync\` or propose a new option via \`wiki schema propose-option ${alias} "${schema.name}" "${rawVal}"\`.`],
+  private async enrichEmptySchemaOptions(
+    cachedDs: CachedDataSource,
+    mutations: RawPropertyMutation[],
+    cachedRows?: NotionPage[],
+  ): Promise<{ ds: CachedDataSource; rows?: NotionPage[] }> {
+    const needsDiscovery = mutations.some((mut) => {
+      if (mut.op === "clear") return false;
+      const schema = this.findProperty(cachedDs, mut.property);
+      return (
+        schema !== undefined &&
+        OPTION_FIELD_TYPES.has(schema.type) &&
+        (schema.options?.length ?? 0) === 0
       );
+    });
+    if (!needsDiscovery) return { ds: cachedDs, rows: cachedRows };
+
+    let rows = cachedRows;
+    if (!rows) {
+      const resp = await this.notion.queryDataSource(cachedDs.data_source_id, {
+        page_size: 20,
+      });
+      rows = resp.results.filter((item): item is NotionPage => item.object === "page");
     }
-    const norm = normalizeNfd(rawVal);
-    const matched = options.find((o) => normalizeNfd(o) === norm);
-    if (!matched) {
-      const hints = [`Valid options for "${schema.name}": ${options.join(", ")}`];
-      if (schema.type === "select" || schema.type === "multi_select") {
-        hints.push(
-          `To add a new option safely, run \`wiki schema propose-option ${alias} "${schema.name}" "${rawVal}"\`.`,
+
+    const updatedProperties: Record<string, CachedProperty> = { ...cachedDs.properties };
+    for (const [id, schema] of Object.entries(cachedDs.properties)) {
+      if (!OPTION_FIELD_TYPES.has(schema.type) || (schema.options?.length ?? 0) > 0) {
+        continue;
+      }
+      const discovered = new Set<string>();
+      for (const row of rows) {
+        const prop = this.findCurrentProperty(row, schema);
+        if (!prop) continue;
+        if (prop.type === "select" && prop.select?.name) {
+          discovered.add(prop.select.name);
+        } else if (prop.type === "status" && prop.status?.name) {
+          discovered.add(prop.status.name);
+        } else if (prop.type === "multi_select") {
+          for (const opt of prop.multi_select ?? []) {
+            if (opt.name) discovered.add(opt.name);
+          }
+        }
+      }
+      if (discovered.size > 0) {
+        updatedProperties[id] = { ...schema, options: [...discovered] };
+      }
+    }
+
+    return { ds: { ...cachedDs, properties: updatedProperties }, rows };
+  }
+
+  private async fetchFullRelationItems(
+    currentPage: NotionPage | undefined,
+    schemas: CachedProperty[],
+  ): Promise<Map<string, string[]>> {
+    const fullById = new Map<string, string[]>();
+    if (!currentPage) return fullById;
+
+    for (const schema of schemas) {
+      if (schema.type !== "relation" || fullById.has(schema.id)) continue;
+      const currentProp = this.findCurrentProperty(currentPage, schema);
+      if (currentProp?.type !== "relation" || !currentProp.has_more) continue;
+
+      const collected: string[] = [];
+      const propertyId = currentProp.id ?? schema.id;
+      let cursor: string | undefined;
+      do {
+        const page = await this.notion.listPagePropertyItems(
+          currentPage.id,
+          propertyId,
+          cursor,
+        );
+        for (const item of page.results) {
+          if (item.relation?.id) collected.push(item.relation.id);
+        }
+        cursor = page.has_more && page.next_cursor ? page.next_cursor : undefined;
+      } while (cursor);
+
+      fullById.set(schema.id, [...new Set(collected)]);
+    }
+    return fullById;
+  }
+
+  private consolidateArrayProperty(params: {
+    ontology: OntologyConfig;
+    profileName: string;
+    alias: string;
+    schema: CachedProperty;
+    muts: RawPropertyMutation[];
+    prevItems: string[];
+    previousFormatted: string;
+    allowDriftRetry: boolean;
+  }): ValidatedPropertyChange {
+    const {
+      ontology,
+      profileName,
+      alias,
+      schema,
+      muts,
+      prevItems,
+      previousFormatted,
+      allowDriftRetry,
+    } = params;
+
+    if (schema.type === "relation") {
+      assertRelationTargetAllowed(this.scopeGuard, ontology, profileName, schema);
+    }
+
+    let working = [...prevItems];
+    const ops: MutationOp[] = [];
+    const rawInputs: string[] = [];
+
+    for (const mut of muts) {
+      if (mut.op === "clear") {
+        working = [];
+        ops.push("clear");
+        continue;
+      }
+      const rawVal = (mut.value ?? "").trim();
+      if (mut.op === "set" && rawVal === "") {
+        working = [];
+        ops.push("clear");
+        rawInputs.push("");
+        continue;
+      }
+      if (!rawVal) {
+        throw new AxiError(
+          "VALIDATION_ERROR",
+          `Operation --${mut.op} on "${schema.name}" requires a non-empty value.`,
         );
       }
-      throw new SchemaDriftError(
-        "VALIDATION_ERROR",
-        `Invalid ${schema.type} value "${rawVal}" for field "${schema.name}".`,
-        hints,
-      );
+
+      rawInputs.push(rawVal);
+      const inputItems = rawVal.split(",").map((s) => s.trim()).filter(Boolean);
+      const parsed =
+        schema.type === "multi_select"
+          ? inputItems.map((v) => snapValidOption(alias, schema, v, allowDriftRetry))
+          : inputItems.map((v) => parseRelationUuid(schema.name, v));
+
+      if (mut.op === "set") {
+        working = [...new Set(parsed)];
+        ops.push("set");
+      } else if (mut.op === "add") {
+        working = [...new Set([...working, ...parsed])];
+        ops.push("add");
+      } else {
+        const toRemove =
+          schema.type === "multi_select"
+            ? new Set(parsed.map((s) => normalizeNfd(s)))
+            : new Set(parsed);
+        working = working.filter((item) =>
+          schema.type === "multi_select"
+            ? !toRemove.has(normalizeNfd(item))
+            : !toRemove.has(item),
+        );
+        ops.push("remove");
+      }
     }
-    return matched;
+
+    let finalOp: MutationOp;
+    if (working.length === 0 && ops[ops.length - 1] === "clear") {
+      finalOp = "clear";
+    } else if (ops.every((o) => o === "add")) {
+      finalOp = "add";
+    } else if (ops.every((o) => o === "remove")) {
+      finalOp = "remove";
+    } else {
+      finalOp = "set";
+    }
+
+    const notionPayload: NotionWritePropertyPayload =
+      finalOp === "clear"
+        ? buildClearPayload(schema)
+        : schema.type === "multi_select"
+          ? { multi_select: working.map((name) => ({ name })) }
+          : { relation: working.map((id) => ({ id })) };
+
+    return {
+      op: finalOp,
+      schema,
+      ...(rawInputs.length > 0 ? { rawInputValue: rawInputs.join(", ") } : {}),
+      notionPayload,
+      previousItems: prevItems,
+      nextItems: working,
+      previousFormatted,
+      nextFormatted: working.join(", "),
+    };
   }
 
   private buildValidatedChanges(params: {
@@ -152,32 +318,41 @@ export class WriteValidator {
     mode: "create" | "update";
     mutations: RawPropertyMutation[];
     currentPage?: NotionPage;
+    fullRelationItems: Map<string, string[]>;
+    allowDriftRetry: boolean;
   }): ValidationResult {
-    const { ontology, profileName, alias, cachedDs, mode, mutations, currentPage } = params;
+    const {
+      ontology,
+      profileName,
+      alias,
+      cachedDs,
+      mode,
+      mutations,
+      currentPage,
+      fullRelationItems,
+      allowDriftRetry,
+    } = params;
+
     const dbOverlay = ontology.databases[alias];
     if (!dbOverlay) {
       throw new AxiError("NOT_FOUND", `Database alias "${alias}" not found in ontology.yaml.`);
     }
 
-    const changes: ValidatedPropertyChange[] = [];
-    const notionProperties: Record<string, Record<string, unknown>> = {};
-    const touchedById = new Map<string, string>();
-    let titleValue: string | undefined;
-
+    // Resolve and group mutations by immutable schema.id preserving first-touch order.
+    const grouped = new Map<string, { schema: CachedProperty; muts: RawPropertyMutation[] }>();
     for (const mut of mutations) {
       const schema = this.findProperty(cachedDs, mut.property);
       if (!schema) {
         const names = Object.values(cachedDs.properties)
           .filter((p) => !p.read_only)
           .map((p) => p.name);
-        throw new SchemaDriftError(
-          "VALIDATION_ERROR",
-          `Unknown property "${mut.property}" on database "${alias}".`,
-          [`Writable properties: ${names.join(", ")}`],
-        );
+        const msg = `Unknown property "${mut.property}" on database "${alias}".`;
+        const help = [`Writable properties: ${names.join(", ")}`];
+        if (allowDriftRetry) {
+          throw new SchemaDriftError("VALIDATION_ERROR", msg, help);
+        }
+        throw new AxiError("VALIDATION_ERROR", msg, help);
       }
-
-      // Check (e): strict write-block on read-only Notion properties.
       if (schema.read_only) {
         throw new AxiError(
           "VALIDATION_ERROR",
@@ -191,128 +366,91 @@ export class WriteValidator {
         );
       }
 
-      const currentProp = currentPage?.properties[schema.name];
-      const previousFormatted = currentProp ? formatNotionPropertyValue(currentProp) : "";
+      const bucket = grouped.get(schema.id);
+      if (bucket) {
+        bucket.muts.push(mut);
+      } else {
+        grouped.set(schema.id, { schema, muts: [mut] });
+      }
+    }
 
-      if (mut.op === "clear") {
-        const clearPayload = this.buildClearPayload(schema);
-        notionProperties[schema.name] = clearPayload;
-        changes.push({
-          op: "clear",
+    const changes: ValidatedPropertyChange[] = [];
+    const notionProperties: Record<string, Record<string, unknown>> = {};
+    const touchedById = new Map<string, string>();
+    let titleValue: string | undefined;
+
+    for (const { schema, muts } of grouped.values()) {
+      const currentProp = this.findCurrentProperty(currentPage, schema);
+      const overridePrev = fullRelationItems.get(schema.id);
+      const prevItems = overridePrev ?? extractCurrentList(currentProp);
+      const previousFormatted = overridePrev
+        ? overridePrev.join(", ")
+        : currentProp
+          ? formatNotionPropertyValue(currentProp)
+          : "";
+
+      if (schema.type === "multi_select" || schema.type === "relation") {
+        const change = this.consolidateArrayProperty({
+          ontology,
+          profileName,
+          alias,
           schema,
-          notionPayload: clearPayload,
+          muts,
+          prevItems,
           previousFormatted,
-          nextFormatted: "",
-          ...(schema.type === "relation" || schema.type === "multi_select"
-            ? { previousItems: this.extractCurrentList(currentProp), nextItems: [] }
-            : {}),
+          allowDriftRetry,
         });
+        notionProperties[schema.name] = change.notionPayload;
+        touchedById.set(schema.id, change.nextFormatted ?? "");
+        changes.push(change);
         continue;
       }
 
-      const rawVal = (mut.value ?? "").trim();
-
-      if (mut.op === "add" || mut.op === "remove") {
-        if (schema.type !== "multi_select" && schema.type !== "relation") {
+      let finalChange: ValidatedPropertyChange | undefined;
+      for (const mut of muts) {
+        if (mut.op === "add" || mut.op === "remove") {
           throw new AxiError(
             "VALIDATION_ERROR",
             `Operation --${mut.op} is only supported on multi_select and relation properties (got "${schema.name}" of type ${schema.type}).`,
           );
         }
-        if (!rawVal) {
-          throw new AxiError(
-            "VALIDATION_ERROR",
-            `Operation --${mut.op} on "${schema.name}" requires a non-empty value.`,
-          );
-        }
-
-        const prevItems = this.extractCurrentList(currentProp);
-        const inputItems = rawVal.split(",").map((s) => s.trim()).filter(Boolean);
-        let nextItems: string[];
-
-        if (schema.type === "multi_select") {
-          const snapped = inputItems.map((v) => this.snapValidOption(alias, schema, v));
-          if (mut.op === "add") {
-            nextItems = [...new Set([...prevItems, ...snapped])];
-          } else {
-            const toRemove = new Set(snapped.map((s) => normalizeNfd(s)));
-            nextItems = prevItems.filter((item) => !toRemove.has(normalizeNfd(item)));
-          }
-          const payload = { multi_select: nextItems.map((name) => ({ name })) };
-          notionProperties[schema.name] = payload;
-          touchedById.set(schema.id, nextItems.join(", "));
-          changes.push({
-            op: mut.op,
+        const rawVal = (mut.value ?? "").trim();
+        if (mut.op === "clear" || rawVal === "") {
+          finalChange = {
+            op: "clear",
             schema,
-            rawInputValue: rawVal,
-            notionPayload: payload,
-            previousItems: prevItems,
-            nextItems,
+            ...(mut.op === "set" ? { rawInputValue: "" } : {}),
+            notionPayload: buildClearPayload(schema),
             previousFormatted,
-            nextFormatted: nextItems.join(", "),
-          });
-        } else {
-          // relation
-          this.assertRelationTargetAllowed(ontology, profileName, schema);
-          const ids = inputItems.map((v) => this.parseRelationUuid(schema.name, v));
-          if (mut.op === "add") {
-            nextItems = [...new Set([...prevItems, ...ids])];
-          } else {
-            const toRemove = new Set(ids);
-            nextItems = prevItems.filter((item) => !toRemove.has(item));
-          }
-          const payload = { relation: nextItems.map((id) => ({ id })) };
-          notionProperties[schema.name] = payload;
-          touchedById.set(schema.id, nextItems.join(", "));
-          changes.push({
-            op: mut.op,
-            schema,
-            rawInputValue: rawVal,
-            notionPayload: payload,
-            previousItems: prevItems,
-            nextItems,
-            previousFormatted,
-            nextFormatted: nextItems.join(", "),
-          });
+            nextFormatted: "",
+          };
+          if (schema.type === "title") titleValue = undefined;
+          continue;
         }
-        continue;
-      }
-
-      // op === "set"
-      if (rawVal === "") {
-        // Setting empty string maps to clearing the field (gated by ApprovalGate on updates).
-        const clearPayload = this.buildClearPayload(schema);
-        notionProperties[schema.name] = clearPayload;
-        changes.push({
-          op: "clear",
+        finalChange = buildSetPayload({
+          scopeGuard: this.scopeGuard,
+          ontology,
+          profileName,
+          alias,
+          dbOverlay,
           schema,
-          rawInputValue: "",
-          notionPayload: clearPayload,
+          rawVal,
+          previousItems: prevItems,
           previousFormatted,
-          nextFormatted: "",
+          allowDriftRetry,
         });
-        continue;
+        if (schema.type === "title") titleValue = rawVal;
       }
 
-      const built = this.buildSetPayload({
-        ontology,
-        profileName,
-        alias,
-        dbOverlay,
-        schema,
-        rawVal,
-        currentProp,
-        previousFormatted,
-      });
-      notionProperties[schema.name] = built.notionPayload;
-      touchedById.set(schema.id, built.nextFormatted ?? rawVal);
-      if (schema.type === "title") {
-        titleValue = rawVal;
+      if (finalChange) {
+        notionProperties[schema.name] = finalChange.notionPayload;
+        touchedById.set(schema.id, finalChange.nextFormatted ?? "");
+        changes.push(finalChange);
       }
-      changes.push(built);
     }
 
-    // Check (c): non-empty title required on page creation.
+    const requiredIds = new Set(dbOverlay.extra_required_fields.map((f) => f.property_id));
+
     if (mode === "create") {
       if (!titleValue || titleValue.trim().length === 0) {
         const titleProp = Object.values(cachedDs.properties).find((p) => p.type === "title");
@@ -321,8 +459,6 @@ export class WriteValidator {
           `Creating a record in "${alias}" requires a non-empty title property ("${titleProp?.name ?? "Name"}").`,
         );
       }
-
-      // Check (h): user-declared extra_required_fields matched by immutable property_id.
       for (const reqField of dbOverlay.extra_required_fields) {
         const val = touchedById.get(reqField.property_id);
         if (!val || val.trim().length === 0) {
@@ -333,291 +469,30 @@ export class WriteValidator {
           );
         }
       }
+    } else {
+      for (const ch of changes) {
+        const isEmpty =
+          ch.op === "clear" ||
+          (ch.nextFormatted ?? "").trim().length === 0 ||
+          ((ch.schema.type === "multi_select" || ch.schema.type === "relation") &&
+            (ch.nextItems?.length ?? 0) === 0);
+        if (!isEmpty) continue;
+        if (ch.schema.type === "title") {
+          throw new AxiError(
+            "VALIDATION_ERROR",
+            `Cannot leave required title property "${ch.schema.name}" empty in "${alias}".`,
+          );
+        }
+        if (requiredIds.has(ch.schema.id)) {
+          throw new AxiError(
+            "VALIDATION_ERROR",
+            `Cannot leave required field "${ch.schema.name}" (property_id: "${ch.schema.id}") empty in "${alias}".`,
+          );
+        }
+      }
     }
 
     return { cachedDs, changes, notionProperties, titleValue };
-  }
-
-  private assertRelationTargetAllowed(
-    ontology: OntologyConfig,
-    profileName: string,
-    schema: CachedProperty,
-  ): void {
-    if (!schema.relation_target_data_source_id) {
-      throw new AxiError(
-        "VALIDATION_ERROR",
-        `Relation property "${schema.name}" has no known target data_source_id in cache.`,
-        ["Run `wiki sync` to refresh database schemas."],
-      );
-    }
-    this.scopeGuard.assertDataSourceAccess(
-      ontology,
-      profileName,
-      schema.relation_target_data_source_id,
-    );
-  }
-
-  private parseRelationUuid(propName: string, input: string): string {
-    const uuid = extractNotionUuid(input);
-    if (!uuid) {
-      throw new AxiError(
-        "VALIDATION_ERROR",
-        `Relation property "${propName}" requires valid Notion page UUIDs (got "${input}").`,
-      );
-    }
-    return uuid;
-  }
-
-  private buildClearPayload(schema: CachedProperty): Record<string, unknown> {
-    switch (schema.type) {
-      case "title":
-        return { title: [] };
-      case "rich_text":
-        return { rich_text: [] };
-      case "status":
-        return { status: null };
-      case "select":
-        return { select: null };
-      case "multi_select":
-        return { multi_select: [] };
-      case "number":
-        return { number: null };
-      case "date":
-        return { date: null };
-      case "url":
-        return { url: null };
-      case "email":
-        return { email: null };
-      case "phone_number":
-        return { phone_number: null };
-      case "relation":
-        return { relation: [] };
-      case "checkbox":
-        return { checkbox: false };
-      default:
-        throw new AxiError(
-          "VALIDATION_ERROR",
-          `Clearing property "${schema.name}" of type "${schema.type}" is not supported.`,
-        );
-    }
-  }
-
-  private buildSetPayload(params: {
-    ontology: OntologyConfig;
-    profileName: string;
-    alias: string;
-    dbOverlay: OntologyConfig["databases"][string];
-    schema: CachedProperty;
-    rawVal: string;
-    currentProp?: NotionPropertyValue;
-    previousFormatted: string;
-  }): ValidatedPropertyChange {
-    const { ontology, profileName, alias, dbOverlay, schema, rawVal, currentProp, previousFormatted } = params;
-
-    switch (schema.type) {
-      case "title":
-        return {
-          op: "set",
-          schema,
-          rawInputValue: rawVal,
-          notionPayload: { title: [{ type: "text", text: { content: rawVal } }] },
-          previousFormatted,
-          nextFormatted: rawVal,
-        };
-      case "rich_text":
-        return {
-          op: "set",
-          schema,
-          rawInputValue: rawVal,
-          notionPayload: { rich_text: [{ type: "text", text: { content: rawVal } }] },
-          previousFormatted,
-          nextFormatted: rawVal,
-        };
-      case "status": {
-        const snapped = this.snapValidOption(alias, schema, rawVal);
-        return {
-          op: "set",
-          schema,
-          rawInputValue: rawVal,
-          notionPayload: { status: { name: snapped } },
-          previousFormatted,
-          nextFormatted: snapped,
-        };
-      }
-      case "select": {
-        const snapped = this.snapValidOption(alias, schema, rawVal);
-        return {
-          op: "set",
-          schema,
-          rawInputValue: rawVal,
-          notionPayload: { select: { name: snapped } },
-          previousFormatted,
-          nextFormatted: snapped,
-        };
-      }
-      case "multi_select": {
-        const prevItems = this.extractCurrentList(currentProp);
-        const items = rawVal.split(",").map((s) => s.trim()).filter(Boolean);
-        const snapped = [...new Set(items.map((v) => this.snapValidOption(alias, schema, v)))];
-        return {
-          op: "set",
-          schema,
-          rawInputValue: rawVal,
-          notionPayload: { multi_select: snapped.map((name) => ({ name })) },
-          previousItems: prevItems,
-          nextItems: snapped,
-          previousFormatted,
-          nextFormatted: snapped.join(", "),
-        };
-      }
-      case "relation": {
-        this.assertRelationTargetAllowed(ontology, profileName, schema);
-        const prevItems = this.extractCurrentList(currentProp);
-        const items = rawVal.split(",").map((s) => s.trim()).filter(Boolean);
-        const ids = [...new Set(items.map((v) => this.parseRelationUuid(schema.name, v)))];
-        return {
-          op: "set",
-          schema,
-          rawInputValue: rawVal,
-          notionPayload: { relation: ids.map((id) => ({ id })) },
-          previousItems: prevItems,
-          nextItems: ids,
-          previousFormatted,
-          nextFormatted: ids.join(", "),
-        };
-      }
-      case "number": {
-        const num = Number(rawVal);
-        if (!Number.isFinite(num)) {
-          throw new AxiError(
-            "VALIDATION_ERROR",
-            `Property "${schema.name}" requires a valid number (got "${rawVal}").`,
-          );
-        }
-        const bounds = dbOverlay.numeric_bounds[schema.id];
-        if (bounds) {
-          if (bounds.min !== undefined && num < bounds.min) {
-            throw new AxiError(
-              "VALIDATION_ERROR",
-              `Property "${schema.name}" value ${num} is below configured minimum ${bounds.min}.`,
-            );
-          }
-          if (bounds.max !== undefined && num > bounds.max) {
-            throw new AxiError(
-              "VALIDATION_ERROR",
-              `Property "${schema.name}" value ${num} exceeds configured maximum ${bounds.max}.`,
-            );
-          }
-        }
-        return {
-          op: "set",
-          schema,
-          rawInputValue: rawVal,
-          notionPayload: { number: num },
-          previousFormatted,
-          nextFormatted: String(num),
-        };
-      }
-      case "checkbox": {
-        const lower = rawVal.toLowerCase();
-        if (lower !== "true" && lower !== "false") {
-          throw new AxiError(
-            "VALIDATION_ERROR",
-            `Property "${schema.name}" requires "true" or "false" (got "${rawVal}").`,
-          );
-        }
-        const checked = lower === "true";
-        return {
-          op: "set",
-          schema,
-          rawInputValue: rawVal,
-          notionPayload: { checkbox: checked },
-          previousFormatted,
-          nextFormatted: String(checked),
-        };
-      }
-      case "date": {
-        const parts = rawVal.split("..").map((s) => s.trim());
-        const start = parts[0]!;
-        const end = parts[1] || null;
-        if (!/^\d{4}-\d{2}-\d{2}/.test(start)) {
-          throw new AxiError(
-            "VALIDATION_ERROR",
-            `Property "${schema.name}" requires ISO-8601 date YYYY-MM-DD (got "${rawVal}").`,
-          );
-        }
-        return {
-          op: "set",
-          schema,
-          rawInputValue: rawVal,
-          notionPayload: { date: end ? { start, end } : { start } },
-          previousFormatted,
-          nextFormatted: rawVal,
-        };
-      }
-      case "url": {
-        try {
-          const parsed = new URL(rawVal);
-          if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-            throw new Error("invalid protocol");
-          }
-        } catch {
-          throw new AxiError(
-            "VALIDATION_ERROR",
-            `Property "${schema.name}" requires a valid http(s) URL (got "${rawVal}").`,
-          );
-        }
-        return {
-          op: "set",
-          schema,
-          rawInputValue: rawVal,
-          notionPayload: { url: rawVal },
-          previousFormatted,
-          nextFormatted: rawVal,
-        };
-      }
-      case "email":
-        return {
-          op: "set",
-          schema,
-          rawInputValue: rawVal,
-          notionPayload: { email: rawVal },
-          previousFormatted,
-          nextFormatted: rawVal,
-        };
-      case "phone_number":
-        return {
-          op: "set",
-          schema,
-          rawInputValue: rawVal,
-          notionPayload: { phone_number: rawVal },
-          previousFormatted,
-          nextFormatted: rawVal,
-        };
-      case "verification": {
-        const state = rawVal.toLowerCase();
-        if (state !== "verified" && state !== "unverified") {
-          throw new AxiError(
-            "VALIDATION_ERROR",
-            `Wiki verification "${schema.name}" accepts "verified" or "unverified" (got "${rawVal}").`,
-          );
-        }
-        // Strip Notion-managed verified_by; write state only.
-        return {
-          op: "set",
-          schema,
-          rawInputValue: rawVal,
-          notionPayload: { verification: { state } },
-          previousFormatted,
-          nextFormatted: state,
-        };
-      }
-      default:
-        throw new AxiError(
-          "VALIDATION_ERROR",
-          `Writing property "${schema.name}" of type "${schema.type}" is not supported.`,
-        );
-    }
   }
 
   /**
@@ -630,8 +505,8 @@ export class WriteValidator {
     mode: "create" | "update";
     mutations: RawPropertyMutation[];
     currentPage?: NotionPage;
+    skipDriftRefresh?: boolean;
   }): Promise<ValidationResult> {
-    // Check (a): Agent Scope write permission.
     this.scopeGuard.assertDatabaseAccess(
       params.ontology,
       params.profileName,
@@ -644,29 +519,49 @@ export class WriteValidator {
       throw new AxiError("NOT_FOUND", `Unknown database alias "${params.alias}".`);
     }
 
-    // Check (b): schema availability, refreshing at most once on unknown property/option.
     const cachedDs = await this.loadDataSourceSchema(
       params.ontology,
       dbOverlay.data_source_id,
       false,
     );
 
-    try {
+    let cachedRows: NotionPage[] | undefined;
+    const relationCache = new Map<string, string[]>();
+
+    const runPass = async (
+      ds: CachedDataSource,
+      allowDriftRetry: boolean,
+    ): Promise<ValidationResult> => {
+      const discovered = await this.enrichEmptySchemaOptions(ds, params.mutations, cachedRows);
+      cachedRows = discovered.rows;
+      const schemas = params.mutations
+        .map((m) => this.findProperty(discovered.ds, m.property))
+        .filter((s): s is CachedProperty => s !== undefined);
+      const uncachedSchemas = schemas.filter((s) => !relationCache.has(s.id));
+      if (uncachedSchemas.length > 0) {
+        const fetched = await this.fetchFullRelationItems(params.currentPage, uncachedSchemas);
+        for (const [k, v] of fetched) {
+          relationCache.set(k, v);
+        }
+      }
       return this.buildValidatedChanges({
         ...params,
-        cachedDs,
+        cachedDs: discovered.ds,
+        fullRelationItems: relationCache,
+        allowDriftRetry,
       });
+    };
+
+    try {
+      return await runPass(cachedDs, !params.skipDriftRefresh);
     } catch (err) {
-      if (err instanceof SchemaDriftError) {
+      if (err instanceof SchemaDriftError && !params.skipDriftRefresh) {
         const refreshed = await this.loadDataSourceSchema(
           params.ontology,
           dbOverlay.data_source_id,
           true,
         );
-        return this.buildValidatedChanges({
-          ...params,
-          cachedDs: refreshed,
-        });
+        return await runPass(refreshed, false);
       }
       throw err;
     }

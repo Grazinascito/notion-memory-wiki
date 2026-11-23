@@ -19,14 +19,14 @@ import type {
   OntologyConfig,
   ProposalRecord,
 } from "../../shared/types.js";
-
-const VALID_PROPOSAL_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 import {
   atomicWriteFile,
   ensureSecureDir,
   expandUserPath,
   withAdvisoryLock,
 } from "../fs/posix-fs.js";
+
+const VALID_PROPOSAL_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -316,13 +316,17 @@ export class JsonMetadataStore implements MetadataStore {
     }
   }
 
-  private proposalPath(proposalId: string): string {
+  private assertValidProposalId(proposalId: string): void {
     if (!VALID_PROPOSAL_ID_RE.test(proposalId)) {
       throw new AxiError(
         "INVALID_ARGUMENT",
         `Invalid proposal_id "${proposalId}". Expected 1-64 alphanumeric, "_" or "-" characters.`,
       );
     }
+  }
+
+  private proposalPath(proposalId: string): string {
+    this.assertValidProposalId(proposalId);
     return path.join(this.wikiHome, "proposals", `${proposalId}.json`);
   }
 
@@ -353,20 +357,8 @@ export class JsonMetadataStore implements MetadataStore {
     }
   }
 
-  async listProposals(): Promise<ProposalRecord[]> {
-    const proposalsDir = path.join(this.wikiHome, "proposals");
-    try {
-      const entries = await fs.readdir(proposalsDir);
-      const records: ProposalRecord[] = [];
-      for (const entry of entries) {
-        if (!entry.endsWith(".json")) continue;
-        const raw = await fs.readFile(path.join(proposalsDir, entry), "utf8");
-        records.push(JSON.parse(raw) as ProposalRecord);
-      }
-      return records.sort((a, b) => a.created_at.localeCompare(b.created_at));
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
-      throw err;
-    }
+  async withProposalLock<T>(proposalId: string, fn: () => Promise<T>): Promise<T> {
+    this.assertValidProposalId(proposalId);
+    return withAdvisoryLock(this.wikiHome, `proposal-${proposalId}`, fn);
   }
 }
