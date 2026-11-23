@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import readline from "node:readline/promises";
-import type { SyncService } from "../core/sync/sync-service.js";
+import type { NotionGateway } from "../core/ports.js";
 import { AxiError } from "../shared/errors.js";
 import { classifyResolution } from "../shared/text.js";
 import type { MetricEvent } from "../shared/types.js";
@@ -120,7 +120,7 @@ async function run(): Promise<void> {
   }
 
   let activeProfile = cliProfile?.trim() || envProfile?.trim() || "unresolved";
-  let activeSyncService: SyncService | null = null;
+  let activeGateway: NotionGateway | null = null;
   let activeResolvedVia: MetricEvent["resolved_via"] = "none";
 
   try {
@@ -159,10 +159,11 @@ async function run(): Promise<void> {
       activeProfile = profileName;
       activeResolvedVia = classifyResolution(rootArg);
       const { token } = await app.secrets.resolveToken({ profile: profileName });
-      const syncService = app.createSyncService(token);
-      activeSyncService = syncService;
+      const gateway = app.createNotionGateway(token);
+      activeGateway = gateway;
+      const setupService = app.createSetupService(gateway);
       const scanOnly = parsed.booleans.has("--scan-only");
-      const result = await syncService.setupWorkspace({
+      const result = await setupService.setupWorkspace({
         rootUrlOrId: rootArg,
         workspaceName: firstFlag(parsed, "--name"),
         profileName,
@@ -260,8 +261,9 @@ async function run(): Promise<void> {
         profile: profileName,
         tokenRef: scope.token_ref,
       });
-      const syncService = app.createSyncService(token);
-      activeSyncService = syncService;
+      const gateway = app.createNotionGateway(token);
+      activeGateway = gateway;
+      const syncService = app.createSyncService(gateway);
       const res = await syncService.syncWorkspace({
         noRender: parsed.booleans.has("--no-render"),
       });
@@ -293,11 +295,12 @@ async function run(): Promise<void> {
         profile: profileName,
         tokenRef: scope.token_ref,
       });
-      const syncService = app.createSyncService(token);
-      activeSyncService = syncService;
+      const gateway = app.createNotionGateway(token);
+      activeGateway = gateway;
+      const queryService = app.createQueryService(gateway);
       const fieldsRaw = firstFlag(parsed, "--fields");
       const limitRaw = firstFlag(parsed, "--limit");
-      const res = await syncService.queryDatabase(profileName, target, {
+      const res = await queryService.queryDatabase(profileName, target, {
         where: parsed.flags.get("--where") ?? [],
         fields: fieldsRaw
           ? fieldsRaw.split(",").map((s) => s.trim()).filter(Boolean)
@@ -335,10 +338,11 @@ async function run(): Promise<void> {
         profile: profileName,
         tokenRef: scope.token_ref,
       });
-      const syncService = app.createSyncService(token);
-      activeSyncService = syncService;
+      const gateway = app.createNotionGateway(token);
+      activeGateway = gateway;
+      const queryService = app.createQueryService(gateway);
       const offsetRaw = firstFlag(parsed, "--offset");
-      const res = await syncService.readPage(profileName, target, {
+      const res = await queryService.readPage(profileName, target, {
         full: parsed.booleans.has("--full"),
         offset: offsetRaw ? Number(offsetRaw) : undefined,
       });
@@ -375,7 +379,7 @@ async function run(): Promise<void> {
         outcome: mapErrorOutcome(axi),
         error_code: axi?.code ?? "UNEXPECTED",
         http_status: axi?.httpStatus ?? null,
-        notion_calls: activeSyncService?.getApiCallCount() ?? 0,
+        notion_calls: activeGateway?.getCallCount() ?? 0,
         duration_ms: Date.now() - startedAt,
       })
       .catch(() => undefined);

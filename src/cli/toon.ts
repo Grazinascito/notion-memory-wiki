@@ -1,10 +1,7 @@
 import type { CatalogEntry } from "../core/ontology/ontology-engine.js";
-import type {
-  QueryDatabaseResult,
-  ReadPageResult,
-  SetupDiscoveryResult,
-  SyncResult,
-} from "../core/sync/sync-service.js";
+import type { QueryDatabaseResult, ReadPageResult } from "../core/query/query-service.js";
+import type { SetupDiscoveryResult } from "../core/sync/setup-service.js";
+import type { SyncResult } from "../core/sync/sync-service.js";
 
 /**
  * Compact TOON (Token-Oriented Object Notation) formatters for AXI CLI output.

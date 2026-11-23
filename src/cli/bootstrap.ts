@@ -9,7 +9,9 @@ import type {
 } from "../core/ports.js";
 import { OntologyEngine } from "../core/ontology/ontology-engine.js";
 import { RenderService } from "../core/ontology/render-service.js";
+import { QueryService } from "../core/query/query-service.js";
 import { ScopeGuard } from "../core/scope/scope-guard.js";
+import { SetupService } from "../core/sync/setup-service.js";
 import { SyncService } from "../core/sync/sync-service.js";
 import { TokenProvider } from "../infra/auth/token-provider.js";
 import { JsonlMetricsLogger } from "../infra/metrics/jsonl-metrics-logger.js";
@@ -27,7 +29,9 @@ export interface AppContainer {
   ontologyEngine: OntologyEngine;
   renderService: RenderService;
   createNotionGateway(token: string): NotionGateway;
-  createSyncService(token: string): SyncService;
+  createSetupService(tokenOrGateway: string | NotionGateway): SetupService;
+  createSyncService(tokenOrGateway: string | NotionGateway): SyncService;
+  createQueryService(tokenOrGateway: string | NotionGateway): QueryService;
 }
 
 export function resolveWikiHome(): string {
@@ -52,14 +56,17 @@ export function bootstrapApp(wikiHome = resolveWikiHome()): AppContainer {
       trafficClass: "interactive",
     });
 
-  const createSyncService = (token: string): SyncService =>
-    new SyncService(
-      createNotionGateway(token),
-      store,
-      scopeGuard,
-      ontologyEngine,
-      renderService,
-    );
+  const asGateway = (tokenOrGateway: string | NotionGateway): NotionGateway =>
+    typeof tokenOrGateway === "string" ? createNotionGateway(tokenOrGateway) : tokenOrGateway;
+
+  const createSetupService = (tokenOrGateway: string | NotionGateway): SetupService =>
+    new SetupService(asGateway(tokenOrGateway), store, renderService);
+
+  const createSyncService = (tokenOrGateway: string | NotionGateway): SyncService =>
+    new SyncService(asGateway(tokenOrGateway), store, renderService);
+
+  const createQueryService = (tokenOrGateway: string | NotionGateway): QueryService =>
+    new QueryService(asGateway(tokenOrGateway), store, scopeGuard, ontologyEngine);
 
   return {
     wikiHome,
@@ -71,6 +78,8 @@ export function bootstrapApp(wikiHome = resolveWikiHome()): AppContainer {
     ontologyEngine,
     renderService,
     createNotionGateway,
+    createSetupService,
     createSyncService,
+    createQueryService,
   };
 }

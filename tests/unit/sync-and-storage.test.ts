@@ -7,8 +7,11 @@ import { formatQueryToon } from "../../src/cli/toon.js";
 import { OntologyEngine } from "../../src/core/ontology/ontology-engine.js";
 import { RenderService } from "../../src/core/ontology/render-service.js";
 import type { NotionGateway } from "../../src/core/ports.js";
+import { QueryService } from "../../src/core/query/query-service.js";
 import { REDACTED_MARKER, ScopeGuard } from "../../src/core/scope/scope-guard.js";
-import { formatNotionPropertyValue, SyncService } from "../../src/core/sync/sync-service.js";
+import { formatNotionPropertyValue } from "../../src/core/sync/notion-mapper.js";
+import { SetupService } from "../../src/core/sync/setup-service.js";
+import { SyncService } from "../../src/core/sync/sync-service.js";
 import { sanitizeNotionUris } from "../../src/shared/text.js";
 import type { NotionPropertyValue } from "../../src/shared/types.js";
 import { TokenProvider } from "../../src/infra/auth/token-provider.js";
@@ -271,8 +274,11 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
         },
       };
 
-      const sync = new SyncService(fakeNotion, store, guard, engine);
-      const setup = await sync.setupWorkspace({
+      const renderService = new RenderService(store, engine);
+      const setupService = new SetupService(fakeNotion, store, renderService);
+      const syncService = new SyncService(fakeNotion, store, renderService);
+      const queryService = new QueryService(fakeNotion, store, guard, engine);
+      const setup = await setupService.setupWorkspace({
         rootUrlOrId: "https://www.notion.so/Personal-Wiki-00000000000000000000000000000000",
       });
 
@@ -283,7 +289,10 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
       assert.equal(setup.unplacedDataSourceIds.length, 0);
       assert.equal(setup.ontology.databases.projects?.area, "project_management");
 
-      const query = await sync.queryDatabase("default", "projects", {
+      const synced = await syncService.syncWorkspace({ noRender: true });
+      assert.equal(synced.syncedDataSources, 1);
+
+      const query = await queryService.queryDatabase("default", "projects", {
         where: ["status=in progress"],
       });
       assert.equal(query.rows.length, 1);
@@ -294,7 +303,7 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
       assert.match(queryToon, new RegExp(`<<<UNTRUSTED_NOTION_CONTENT nonce=${query.nonce}`));
       assert.match(queryToon, new RegExp(`<<<END_UNTRUSTED_NOTION_CONTENT nonce=${query.nonce}>>>`));
 
-      const page = await sync.readPage("default", "11111111-1111-1111-1111-111111111111");
+      const page = await queryService.readPage("default", "11111111-1111-1111-1111-111111111111");
       assert.match(page.content, /<<<UNTRUSTED_NOTION_CONTENT nonce=[0-9a-f]{16}/);
       assert.equal(page.content.includes("javascript:"), false);
       assert.match(page.content, /\[blocked-uri\]/);
@@ -433,10 +442,14 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
         getMe: async () => ({ id: "user-1", name: "Human", type: "person" }),
       } as unknown as NotionGateway;
 
-      const sync = new SyncService(fakeNotion, store, guard, engine);
+      const setupService = new SetupService(
+        fakeNotion,
+        store,
+        new RenderService(store, engine),
+      );
       await assert.rejects(
         () =>
-          sync.setupWorkspace({
+          setupService.setupWorkspace({
             rootUrlOrId: "00000000-0000-0000-0000-000000000000",
           }),
         (err: unknown) => err instanceof AxiError && err.code === "SCOPE_DENIED",
@@ -708,8 +721,10 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
         },
       };
 
-      const sync = new SyncService(fakeNotion, store, guard, engine);
-      const setup = await sync.setupWorkspace({
+      const renderService = new RenderService(store, engine);
+      const setupService = new SetupService(fakeNotion, store, renderService);
+      const queryService = new QueryService(fakeNotion, store, guard, engine);
+      const setup = await setupService.setupWorkspace({
         rootUrlOrId: "00000000-0000-0000-0000-000000000000",
         renderTarget,
       });
@@ -719,7 +734,7 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
       assert.match(renderedFile, /notion-memory-wiki:start/);
 
       await assert.rejects(
-        () => sync.queryDatabase("default", "projects", { follow: "HealthLink" }),
+        () => queryService.queryDatabase("default", "projects", { follow: "HealthLink" }),
         (err: unknown) => err instanceof AxiError && err.code === "SCOPE_DENIED",
       );
     } finally {
