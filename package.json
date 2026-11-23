@@ -1,0 +1,26 @@
+{
+  "name": "notion-memory-wiki",
+  "version": "0.1.0",
+  "description": "Platform-agnostic Context System CLI over Notion with 3-level Progressive Disclosure, Agent Scope, and Notion-wins Context Sync",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "bin": {
+    "wiki": "./dist/src/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/src/cli/index.js",
+    "check:layers": "node scripts/check-layers.mjs",
+    "test": "npm run build && npm run check:layers && node --test dist/tests/unit/**/*.test.js",
+    "dev": "tsx src/cli/index.ts"
+  },
+  "dependencies": {
+    "yaml": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
