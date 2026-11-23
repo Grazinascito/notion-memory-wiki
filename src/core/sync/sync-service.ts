@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { AxiError } from "../../shared/errors.js";
 import {
+  classifyResolution,
   extractNotionUuid,
   normalizeNfd,
   sanitizeNotionUris,
@@ -17,12 +18,16 @@ import type {
   NotionBlock,
   NotionDataSource,
   NotionDatabase,
+  NotionFormulaValue,
   NotionPage,
+  NotionPropertyValue,
   NotionRichText,
+  NotionRollupValue,
   OntologyConfig,
 } from "../../shared/types.js";
 import type { MetadataStore, NotionGateway } from "../ports.js";
 import type { OntologyEngine } from "../ontology/ontology-engine.js";
+import { RenderService } from "../ontology/render-service.js";
 import type { ScopeGuard } from "../scope/scope-guard.js";
 
 const READ_ONLY_PROPERTY_TYPES = new Set([
@@ -69,6 +74,7 @@ export interface SyncResult {
 
 export interface ReadPageResult {
   pageId: string;
+  resolvedVia: "alias" | "search" | "raw_url" | "fractal";
   content: string;
   truncated: boolean;
   totalChars: number;
@@ -81,7 +87,9 @@ export interface QueryDatabaseResult {
   alias: string;
   dataSourceId: string;
   resolvedVia: "alias" | "search";
+  nonce: string;
   rows: Array<{ id: string; fields: Record<string, string> }>;
+  wrappedRows: string;
   hasMore: boolean;
   nextCursor: string | null;
   apiCalls: number;
@@ -94,8 +102,8 @@ function richTextToPlain(items?: NotionRichText[]): string {
 
 function extractPageTitle(page: NotionPage): string {
   for (const val of Object.values(page.properties)) {
-    if (val && val.type === "title" && Array.isArray(val.title)) {
-      return richTextToPlain(val.title as NotionRichText[]);
+    if (val.type === "title") {
+      return richTextToPlain(val.title);
     }
   }
   return "Untitled";
@@ -111,10 +119,33 @@ function toCachedDataSource(
 ): CachedDataSource {
   const properties: Record<string, CachedProperty> = {};
   for (const [propName, schema] of Object.entries(ds.properties)) {
-    const options =
-      schema.select?.options.map((o) => o.name) ??
-      schema.multi_select?.options.map((o) => o.name) ??
-      schema.status?.options.map((o) => o.name);
+    let options: string[] | undefined;
+    let relationTargetDataSourceId: string | undefined;
+    let rollupRelationPropertyName: string | undefined;
+    let formulaExpression: string | undefined;
+
+    switch (schema.type) {
+      case "select":
+        options = schema.select.options.map((o) => o.name);
+        break;
+      case "multi_select":
+        options = schema.multi_select.options.map((o) => o.name);
+        break;
+      case "status":
+        options = schema.status.options.map((o) => o.name);
+        break;
+      case "relation":
+        relationTargetDataSourceId = schema.relation.data_source_id;
+        break;
+      case "rollup":
+        rollupRelationPropertyName = schema.rollup.relation_property_name;
+        break;
+      case "formula":
+        formulaExpression = schema.formula.expression;
+        break;
+      default:
+        break;
+    }
 
     properties[schema.id] = {
       id: schema.id,
@@ -122,15 +153,13 @@ function toCachedDataSource(
       type: schema.type,
       read_only: READ_ONLY_PROPERTY_TYPES.has(schema.type),
       ...(options ? { options } : {}),
-      ...(schema.relation?.data_source_id
-        ? { relation_target_data_source_id: schema.relation.data_source_id }
+      ...(relationTargetDataSourceId
+        ? { relation_target_data_source_id: relationTargetDataSourceId }
         : {}),
-      ...(schema.rollup?.relation_property_name
-        ? { rollup_relation_property_name: schema.rollup.relation_property_name }
+      ...(rollupRelationPropertyName
+        ? { rollup_relation_property_name: rollupRelationPropertyName }
         : {}),
-      ...(schema.formula?.expression
-        ? { formula_expression: schema.formula.expression }
-        : {}),
+      ...(formulaExpression ? { formula_expression: formulaExpression } : {}),
     };
   }
 
@@ -168,75 +197,115 @@ function buildRelationEdges(
   return edges;
 }
 
-export function formatNotionPropertyValue(raw: Record<string, unknown> | string): string {
-  if (typeof raw === "string") return raw;
-  const type = String(raw.type ?? "");
-  switch (type) {
-    case "title":
-      return richTextToPlain(raw.title as NotionRichText[] | undefined);
-    case "rich_text":
-      return richTextToPlain(raw.rich_text as NotionRichText[] | undefined);
-    case "status":
-      return ((raw.status as { name?: string } | null)?.name) ?? "";
-    case "select":
-      return ((raw.select as { name?: string } | null)?.name) ?? "";
-    case "multi_select":
-      return ((raw.multi_select as Array<{ name: string }> | undefined) ?? [])
-        .map((o) => o.name)
-        .join(", ");
+function formatDateRange(d: { start: string; end?: string | null } | null): string {
+  if (!d?.start) return "";
+  return d.end ? `${d.start}..${d.end}` : d.start;
+}
+
+function formatFormulaValue(f: NotionFormulaValue): string {
+  switch (f.type) {
+    case "string":
+      return f.string ?? "";
     case "number":
-      return raw.number === null || raw.number === undefined ? "" : String(raw.number);
-    case "checkbox":
-      return raw.checkbox ? "true" : "false";
-    case "url":
-      return String(raw.url ?? "");
-    case "email":
-      return String(raw.email ?? "");
-    case "phone_number":
-      return String(raw.phone_number ?? "");
-    case "date": {
-      const d = raw.date as { start?: string; end?: string | null } | null;
-      if (!d?.start) return "";
-      return d.end ? `${d.start}..${d.end}` : d.start;
-    }
-    case "relation": {
-      const rels = (raw.relation as Array<{ id: string }> | undefined) ?? [];
-      return rels.map((r) => r.id).join(", ");
-    }
-    case "formula": {
-      const f = raw.formula as Record<string, unknown> | undefined;
-      if (!f) return "";
-      const fType = String(f.type ?? "");
-      return f[fType] === null || f[fType] === undefined ? "" : String(f[fType]);
-    }
-    case "rollup": {
-      const r = raw.rollup as Record<string, unknown> | undefined;
-      if (!r) return "";
-      const rType = String(r.type ?? "");
-      if (rType === "array" && Array.isArray(r.array)) {
-        return (r.array as Array<Record<string, unknown>>)
-          .map((item) => formatNotionPropertyValue(item))
-          .filter(Boolean)
-          .join(", ");
-      }
-      return r[rType] === null || r[rType] === undefined ? "" : String(r[rType]);
-    }
-    case "created_time":
-      return String(raw.created_time ?? "");
-    case "last_edited_time":
-      return String(raw.last_edited_time ?? "");
-    default:
+      return f.number === null ? "" : String(f.number);
+    case "boolean":
+      return f.boolean === null ? "" : String(f.boolean);
+    case "date":
+      return formatDateRange(f.date);
+  }
+}
+
+function formatRollupValue(r: NotionRollupValue): string {
+  switch (r.type) {
+    case "number":
+      return r.number === null ? "" : String(r.number);
+    case "date":
+      return formatDateRange(r.date);
+    case "array":
+      return r.array
+        .map((item) => formatNotionPropertyValue(item))
+        .filter(Boolean)
+        .join(", ");
+    case "unsupported":
+    case "incomplete":
       return "";
   }
 }
 
+export function formatNotionPropertyValue(raw: NotionPropertyValue | string): string {
+  if (typeof raw === "string") return raw;
+  switch (raw.type) {
+    case "title":
+      return richTextToPlain(raw.title);
+    case "rich_text":
+      return richTextToPlain(raw.rich_text);
+    case "status":
+      return raw.status?.name ?? "";
+    case "select":
+      return raw.select?.name ?? "";
+    case "multi_select":
+      return raw.multi_select.map((o) => o.name).join(", ");
+    case "number":
+      return raw.number === null ? "" : String(raw.number);
+    case "checkbox":
+      return raw.checkbox ? "true" : "false";
+    case "url":
+      return raw.url ?? "";
+    case "email":
+      return raw.email ?? "";
+    case "phone_number":
+      return raw.phone_number ?? "";
+    case "date":
+      return formatDateRange(raw.date);
+    case "relation":
+      return raw.relation.map((r) => r.id).join(", ");
+    case "formula":
+      return formatFormulaValue(raw.formula);
+    case "rollup":
+      return formatRollupValue(raw.rollup);
+    case "created_time":
+      return raw.created_time;
+    case "last_edited_time":
+      return raw.last_edited_time;
+    case "verification":
+      if (!raw.verification) return "";
+      return raw.verification.date?.start
+        ? `${raw.verification.state} (${raw.verification.date.start})`
+        : raw.verification.state;
+    case "unsupported":
+      return "";
+  }
+}
+
+function formatQueryRowLines(
+  rows: Array<{ id: string; fields: Record<string, string> }>,
+): string {
+  return rows
+    .map((row) => {
+      const pairs = Object.entries(row.fields)
+        .map(([k, v]) => `${k}=${v.replace(/\s+/g, " ").trim()}`)
+        .join(" | ");
+      return `  ${row.id} | ${pairs}`;
+    })
+    .join("\n");
+}
+
 export class SyncService {
+  private readonly renderService: RenderService;
+
   constructor(
     private readonly notion: NotionGateway,
     private readonly store: MetadataStore,
     private readonly scopeGuard: ScopeGuard,
     private readonly ontologyEngine: OntologyEngine,
-  ) {}
+    renderService?: RenderService,
+  ) {
+    this.renderService = renderService ?? new RenderService(store, ontologyEngine);
+  }
+
+  getApiCallCount(): number {
+    return this.notion.getCallCount();
+  }
 
   private async listAllBlocksInContainer(
     blockId: string,
@@ -269,9 +338,9 @@ export class SyncService {
 
   /**
    * Bounded 2-level workspace discovery combining:
-   * 1. Root page blocks + official Wiki root data_source query (result_type)
+   * 1. Root page blocks + official Wiki root data_source query (result_type: "page" & "data_source")
    * 2. Paginated POST /v1/search (object: "data_source")
-   * 3. GET /v1/views?data_source_id=... resolving view.parent.database_id back to hubs
+   * 3. Paginated GET /v1/views?data_source_id=... resolving view.parent.database_id back to hubs
    */
   async setupWorkspace(options: {
     rootUrlOrId: string;
@@ -279,6 +348,7 @@ export class SyncService {
     profileName?: string;
     renderTarget?: string;
     apply?: boolean;
+    allowPat?: boolean;
   }): Promise<SetupDiscoveryResult> {
     const startCalls = this.notion.getCallCount();
     const rootId = extractNotionUuid(options.rootUrlOrId);
@@ -289,7 +359,16 @@ export class SyncService {
       );
     }
 
-    await this.notion.getMe();
+    const me = await this.notion.getMe();
+    if (me.type !== "bot" && !options.allowPat) {
+      throw new AxiError(
+        "SCOPE_DENIED",
+        `Refusing setup with non-bot token type "${me.type}" (Personal Access Tokens carry full user permissions).`,
+        [
+          "Use a Notion internal integration token (type=bot) scoped to shared pages, or pass --allow-pat to override explicitly.",
+        ],
+      );
+    }
 
     // 1. Detect regular page vs native Wiki database.
     let rootType: "page" | "wiki_database" = "page";
@@ -298,6 +377,7 @@ export class SyncService {
     let wikiBlocksSupported: boolean | null = null;
     const hubs: CachedTaxonomyNode[] = [];
     const directDbContainerToParent = new Map<string, string>();
+    const directWikiDataSources: NotionDataSource[] = [];
     const unsupportedBlockIdsByHub = new Map<string, Set<string>>();
 
     let rootDatabase: NotionDatabase | null = null;
@@ -315,9 +395,8 @@ export class SyncService {
       rootTitle = options.workspaceName ?? (extractPageTitle(rootPage) || "notion-wiki");
     }
 
-    // Enumerate level-1 hubs.
+    // Enumerate level-1 hubs and direct child data sources.
     if (rootType === "wiki_database" && rootDataSourceId) {
-      // Official Notion Wiki data source query using result_type: "page" (zero prose reads).
       let cursor: string | undefined;
       do {
         const resp = await this.notion.queryDataSource(rootDataSourceId, {
@@ -336,6 +415,26 @@ export class SyncService {
         }
         cursor = resp.has_more ? (resp.next_cursor ?? undefined) : undefined;
       } while (cursor);
+
+      let dsCursor: string | undefined;
+      do {
+        const resp = await this.notion.queryDataSource(rootDataSourceId, {
+          result_type: "data_source",
+          page_size: 100,
+          ...(dsCursor ? { start_cursor: dsCursor } : {}),
+        });
+        for (const item of resp.results) {
+          if (item.object === "data_source" && item.id !== rootDataSourceId) {
+            directWikiDataSources.push(item);
+            if (item.parent.type === "database_id") {
+              directDbContainerToParent.set(item.parent.database_id, rootId);
+            } else if (item.parent.type === "page_id") {
+              directDbContainerToParent.set(item.id, item.parent.page_id);
+            }
+          }
+        }
+        dsCursor = resp.has_more ? (resp.next_cursor ?? undefined) : undefined;
+      } while (dsCursor);
 
       // Probe GET /v1/blocks/{rootId}/children once gracefully (Section 5 live check).
       try {
@@ -391,7 +490,10 @@ export class SyncService {
     }
 
     // 2. Paginated POST /v1/search for all shared data_sources (excluding the root wiki data source).
-    const discoveredDs: NotionDataSource[] = [];
+    const discoveredDsById = new Map<string, NotionDataSource>();
+    for (const ds of directWikiDataSources) {
+      discoveredDsById.set(ds.id, ds);
+    }
     let searchCursor: string | undefined;
     do {
       const resp = await this.notion.search({
@@ -401,43 +503,70 @@ export class SyncService {
       });
       for (const item of resp.results) {
         if (item.object === "data_source" && item.id !== rootDataSourceId) {
-          discoveredDs.push(item);
+          discoveredDsById.set(item.id, item);
         }
       }
       searchCursor = resp.has_more ? (resp.next_cursor ?? undefined) : undefined;
     } while (searchCursor);
+    const discoveredDs = [...discoveredDsById.values()];
 
-    // 3. Reconcile linked views via GET /v1/views?data_source_id=...
+    // 3. Reconcile linked views via paginated GET /v1/views?data_source_id=...
     const matchedUnsupportedBlocks = new Set<string>();
     const dsToParentHub = new Map<string, string>();
     const approvedLinkedViewIds: string[] = [];
+    const knownHubIds = new Set<string>([rootId, ...hubs.map((h) => h.page_id)]);
 
     for (const ds of discoveredDs) {
       const dbId = ds.parent.type === "database_id" ? ds.parent.database_id : ds.id;
-      const directHub = directDbContainerToParent.get(dbId);
+      const directHub =
+        directDbContainerToParent.get(dbId) ?? directDbContainerToParent.get(ds.id);
       if (directHub) {
         dsToParentHub.set(ds.id, directHub);
       }
 
       try {
-        const viewsResp = await this.notion.listViews({ data_source_id: ds.id });
-        for (const view of viewsResp.results) {
-          if (view.parent.type === "database_id") {
-            const viewDbId = view.parent.database_id;
-            // Match linked view container database_id against unsupported or child_database blocks in hubs.
-            for (const [hubId, unsupSet] of unsupportedBlockIdsByHub.entries()) {
-              if (unsupSet.has(viewDbId)) {
-                matchedUnsupportedBlocks.add(viewDbId);
-                if (!dsToParentHub.has(ds.id)) {
-                  dsToParentHub.set(ds.id, hubId);
+        let viewCursor: string | undefined;
+        do {
+          const viewsResp = await this.notion.listViews({
+            data_source_id: ds.id,
+            ...(viewCursor ? { start_cursor: viewCursor } : {}),
+          });
+          for (const view of viewsResp.results) {
+            if (view.parent.type === "database_id") {
+              const viewDbId = view.parent.database_id;
+              let matched = false;
+              for (const [hubId, unsupSet] of unsupportedBlockIdsByHub.entries()) {
+                if (unsupSet.has(viewDbId)) {
+                  matchedUnsupportedBlocks.add(viewDbId);
+                  if (!dsToParentHub.has(ds.id)) {
+                    dsToParentHub.set(ds.id, hubId);
+                  }
+                  if (!approvedLinkedViewIds.includes(view.id)) {
+                    approvedLinkedViewIds.push(view.id);
+                  }
+                  matched = true;
                 }
-                if (!approvedLinkedViewIds.includes(view.id)) {
-                  approvedLinkedViewIds.push(view.id);
+              }
+              // Fall back to GET /v1/databases/{view.parent.database_id} when view container wasn't matched directly.
+              if (!matched && !dsToParentHub.has(ds.id)) {
+                try {
+                  const viewDb = await this.notion.getDatabase(viewDbId);
+                  const parentPageId =
+                    viewDb.parent.type === "page_id" ? viewDb.parent.page_id : null;
+                  if (parentPageId && knownHubIds.has(parentPageId)) {
+                    dsToParentHub.set(ds.id, parentPageId);
+                    if (!approvedLinkedViewIds.includes(view.id)) {
+                      approvedLinkedViewIds.push(view.id);
+                    }
+                  }
+                } catch {
+                  // Linked view container database inaccessible; leave unplaced for confirmation.
                 }
               }
             }
           }
-        }
+          viewCursor = viewsResp.has_more ? (viewsResp.next_cursor ?? undefined) : undefined;
+        } while (viewCursor);
       } catch {
         // If Views API returns 404/403 on a data source, search reconciliation still surfaces it.
       }
@@ -560,6 +689,9 @@ export class SyncService {
     if (options.apply !== false) {
       await this.store.writeOntology(ontology);
       await this.store.writeCache(cache);
+      if (options.renderTarget) {
+        await this.renderService.renderProfile(profileName);
+      }
     }
 
     return {
@@ -582,7 +714,7 @@ export class SyncService {
    * Notion-wins structural sync: strictly read-only on ontology.yaml;
    * refreshes confirmed data_source_ids and guide_pages timestamps into cache.json.
    */
-  async syncWorkspace(): Promise<SyncResult> {
+  async syncWorkspace(options: { noRender?: boolean } = {}): Promise<SyncResult> {
     const startCalls = this.notion.getCallCount();
     const ontology = await this.store.readOntology();
     const prevCache = await this.store.readCache();
@@ -639,6 +771,9 @@ export class SyncService {
     };
 
     await this.store.writeCache(snapshot);
+    if (!options.noRender) {
+      await this.renderService.renderAllRenderProfiles();
+    }
 
     return {
       syncedDataSources: Object.keys(dataSources).length,
@@ -658,11 +793,16 @@ export class SyncService {
     const cache = await this.store.readCache();
     const fractals = await this.store.readFractalPointers();
 
-    const pageId = extractNotionUuid(targetInput);
+    const guideMatch = this.ontologyEngine.resolveGuidePage(
+      ontology,
+      profileName,
+      targetInput,
+    );
+    const pageId = guideMatch ? guideMatch.pageId : extractNotionUuid(targetInput);
     if (!pageId) {
       throw new AxiError(
         "INVALID_ARGUMENT",
-        `Expected a Notion page UUID or URL for \`wiki read\`, got "${targetInput}".`,
+        `Expected a Notion page UUID, URL, or guide alias for \`wiki read\`, got "${targetInput}".`,
       );
     }
 
@@ -686,6 +826,7 @@ export class SyncService {
 
     return {
       pageId,
+      resolvedVia: guideMatch ? "alias" : classifyResolution(targetInput, "alias"),
       content: wrapped,
       truncated: mdResp.truncated || hasMoreLocal,
       totalChars: sanitized.length,
@@ -703,11 +844,12 @@ export class SyncService {
       fields?: string[];
       limit?: number;
       cursor?: string;
+      follow?: string;
     } = {},
   ): Promise<QueryDatabaseResult> {
     const startCalls = this.notion.getCallCount();
     const ontology = await this.store.readOntology();
-    const cache = await this.store.readCache();
+    let cache = await this.store.readCache();
 
     const resolved = this.ontologyEngine.resolveDatabase(
       ontology,
@@ -717,7 +859,60 @@ export class SyncService {
     );
     this.scopeGuard.assertDatabaseAccess(ontology, profileName, resolved.alias, "read");
 
-    const cachedDs = cache?.data_sources[resolved.dataSourceId];
+    // Ensure schema is available for filter building and scope filtering (fail closed otherwise).
+    if (!cache?.data_sources[resolved.dataSourceId]) {
+      const liveDs = await this.notion.getDataSource(resolved.dataSourceId);
+      const cachedDs = toCachedDataSource(liveDs, null);
+      cache = {
+        schema_version: 1,
+        synced_at: new Date().toISOString(),
+        root: cache?.root ?? {
+          id: ontology.workspace.root_id,
+          type: ontology.workspace.root_type,
+          is_wiki: ontology.workspace.root_type === "wiki_database",
+        },
+        taxonomy_nodes: cache?.taxonomy_nodes ?? [],
+        data_sources: {
+          ...(cache?.data_sources ?? {}),
+          [cachedDs.data_source_id]: cachedDs,
+        },
+        relation_edges: buildRelationEdges({
+          ...(cache?.data_sources ?? {}),
+          [cachedDs.data_source_id]: cachedDs,
+        }),
+        guide_pages: cache?.guide_pages ?? [],
+      };
+    }
+
+    const cachedDs = cache.data_sources[resolved.dataSourceId];
+
+    // Enforce Agent Scope on --follow <relation> before querying Notion.
+    let followRelationName: string | null = null;
+    let followTargetDsId: string | null = null;
+    if (options.follow) {
+      const followNorm = normalizeNfd(options.follow);
+      const relSchema = cachedDs
+        ? Object.values(cachedDs.properties).find(
+            (p) =>
+              p.type === "relation" &&
+              (normalizeNfd(p.name) === followNorm || p.id === options.follow),
+          )
+        : undefined;
+      if (!relSchema || !relSchema.relation_target_data_source_id) {
+        throw new AxiError(
+          "INVALID_ARGUMENT",
+          `Property "${options.follow}" on "${resolved.alias}" is not a relation property with a known target.`,
+        );
+      }
+      this.scopeGuard.assertDataSourceAccess(
+        ontology,
+        profileName,
+        relSchema.relation_target_data_source_id,
+      );
+      followRelationName = relSchema.name;
+      followTargetDsId = relSchema.relation_target_data_source_id;
+    }
+
     const filter = this.buildFilter(options.where ?? [], cachedDs);
     const pageSize = Math.min(100, Math.max(1, options.limit ?? 20));
 
@@ -731,7 +926,9 @@ export class SyncService {
       ? new Set(options.fields.map((f) => normalizeNfd(f)))
       : null;
 
+    const followedPageCache = new Map<string, string>();
     const rows: Array<{ id: string; fields: Record<string, string> }> = [];
+
     for (const item of resp.results) {
       if (item.object !== "page") continue;
       const scopedProps = this.scopeGuard.filterRecordProperties(
@@ -754,14 +951,55 @@ export class SyncService {
           formatted[propName] = str;
         }
       }
+
+      if (followRelationName && followTargetDsId) {
+        const relProp = scopedProps[followRelationName];
+        if (relProp && typeof relProp !== "string" && relProp.type === "relation") {
+          const titles: string[] = [];
+          for (const relRef of relProp.relation.slice(0, 5)) {
+            let label = followedPageCache.get(relRef.id);
+            if (label === undefined) {
+              const targetPage = await this.notion.getPage(relRef.id);
+              const filteredTarget = this.scopeGuard.filterRecordProperties(
+                ontology,
+                cache,
+                profileName,
+                followTargetDsId,
+                targetPage.properties,
+              );
+              const titleProp = Object.values(filteredTarget).find(
+                (v): v is Extract<NotionPropertyValue, { type: "title" }> =>
+                  typeof v !== "string" && v.type === "title",
+              );
+              label = titleProp
+                ? sanitizeNotionUris(formatNotionPropertyValue(titleProp))
+                : relRef.id;
+              followedPageCache.set(relRef.id, label);
+            }
+            titles.push(label);
+          }
+          if (titles.length > 0) {
+            formatted[`${followRelationName}_titles`] = titles.join(", ");
+          }
+        }
+      }
+
       rows.push({ id: item.id, fields: formatted });
     }
+
+    const nonce = crypto.randomBytes(8).toString("hex");
+    const wrappedRows =
+      rows.length > 0
+        ? wrapUntrustedContent(formatQueryRowLines(rows), nonce)
+        : "  (no matching rows)";
 
     return {
       alias: resolved.alias,
       dataSourceId: resolved.dataSourceId,
       resolvedVia: resolved.resolvedVia,
+      nonce,
       rows,
+      wrappedRows,
       hasMore: resp.has_more,
       nextCursor: resp.next_cursor,
       apiCalls: this.notion.getCallCount() - startCalls,

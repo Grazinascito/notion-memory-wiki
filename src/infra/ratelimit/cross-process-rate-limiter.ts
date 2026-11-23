@@ -7,13 +7,15 @@ import {
   ensureSecureDir,
   expandUserPath,
   withAdvisoryLock,
-} from "../storage/json-metadata-store.js";
+} from "../fs/posix-fs.js";
 
 export interface RateLimiterOptions {
   wikiHome: string;
   interactiveRatePerSec?: number;
   maintenanceRatePerSec?: number;
   burst?: number;
+  maxInFlightInteractive?: number;
+  maxInFlightMaintenance?: number;
   activeChatYieldMs?: number;
 }
 
@@ -21,6 +23,8 @@ const DEFAULT_INTERACTIVE_RATE = 2.5;
 const QUERY_ENDPOINT_MAX_RATE = 3.0;
 const DEFAULT_MAINTENANCE_RATE = 1.0;
 const DEFAULT_BURST = 3;
+const DEFAULT_MAX_IN_FLIGHT_INTERACTIVE = 3;
+const DEFAULT_MAX_IN_FLIGHT_MAINTENANCE = 1;
 const DEFAULT_ACTIVE_CHAT_YIELD_MS = 60_000;
 
 function emptyState(now: number): RateLimitState {
@@ -29,6 +33,10 @@ function emptyState(now: number): RateLimitState {
     retry_after_until: 0,
     last_reason: null,
     last_active_chat_at: 0,
+    global: {
+      tokens: DEFAULT_BURST,
+      last_refill_ms: now,
+    },
     endpoints: {},
   };
 }
@@ -38,19 +46,65 @@ export class CrossProcessRateLimiter implements RateLimiter {
   private readonly interactiveRate: number;
   private readonly maintenanceRate: number;
   private readonly burst: number;
+  private readonly maxInFlightInteractive: number;
+  private readonly maxInFlightMaintenance: number;
   private readonly activeChatYieldMs: number;
+
+  private inFlightInteractive = 0;
+  private inFlightMaintenance = 0;
+  private readonly inFlightWaiters: Array<() => void> = [];
 
   constructor(options: RateLimiterOptions) {
     this.wikiHome = expandUserPath(options.wikiHome);
     this.interactiveRate = options.interactiveRatePerSec ?? DEFAULT_INTERACTIVE_RATE;
     this.maintenanceRate = options.maintenanceRatePerSec ?? DEFAULT_MAINTENANCE_RATE;
     this.burst = options.burst ?? DEFAULT_BURST;
+    this.maxInFlightInteractive =
+      options.maxInFlightInteractive ?? DEFAULT_MAX_IN_FLIGHT_INTERACTIVE;
+    this.maxInFlightMaintenance =
+      options.maxInFlightMaintenance ?? DEFAULT_MAX_IN_FLIGHT_MAINTENANCE;
     this.activeChatYieldMs =
       options.activeChatYieldMs ?? DEFAULT_ACTIVE_CHAT_YIELD_MS;
   }
 
   private statePath(): string {
     return path.join(this.wikiHome, "rate-limit-state.json");
+  }
+
+  private async acquireInFlightSlot(
+    trafficClass: "interactive" | "maintenance",
+  ): Promise<void> {
+    for (;;) {
+      if (
+        trafficClass === "interactive" &&
+        this.inFlightInteractive < this.maxInFlightInteractive
+      ) {
+        this.inFlightInteractive += 1;
+        return;
+      }
+      if (
+        trafficClass === "maintenance" &&
+        this.inFlightMaintenance < this.maxInFlightMaintenance
+      ) {
+        this.inFlightMaintenance += 1;
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        this.inFlightWaiters.push(resolve);
+      });
+    }
+  }
+
+  release(trafficClass: "interactive" | "maintenance"): void {
+    if (trafficClass === "interactive") {
+      this.inFlightInteractive = Math.max(0, this.inFlightInteractive - 1);
+    } else {
+      this.inFlightMaintenance = Math.max(0, this.inFlightMaintenance - 1);
+    }
+    const waiters = this.inFlightWaiters.splice(0, this.inFlightWaiters.length);
+    for (const wake of waiters) {
+      wake();
+    }
   }
 
   async readState(): Promise<RateLimitState> {
@@ -78,65 +132,101 @@ export class CrossProcessRateLimiter implements RateLimiter {
     endpointKey: string,
     trafficClass: "interactive" | "maintenance",
   ): Promise<void> {
-    for (;;) {
-      const sleepMs = await withAdvisoryLock(
-        this.wikiHome,
-        "rate-limit-state",
-        async () => {
-          const now = Date.now();
-          const state = await this.readState();
+    await this.acquireInFlightSlot(trafficClass);
+    try {
+      for (;;) {
+        const sleepMs = await withAdvisoryLock(
+          this.wikiHome,
+          "rate-limit-state",
+          async () => {
+            const now = Date.now();
+            const state = await this.readState();
 
-          const endpointCooldown = state.endpoints[endpointKey]?.retry_after_until ?? 0;
-          const blockedUntil = Math.max(state.retry_after_until, endpointCooldown);
-          if (blockedUntil > now) {
-            return blockedUntil - now;
-          }
+            const endpointCooldown = state.endpoints[endpointKey]?.retry_after_until ?? 0;
+            const blockedUntil = Math.max(state.retry_after_until, endpointCooldown);
+            if (blockedUntil > now) {
+              return blockedUntil - now;
+            }
 
-          if (
-            trafficClass === "maintenance" &&
-            state.last_active_chat_at > 0 &&
-            now - state.last_active_chat_at < this.activeChatYieldMs
-          ) {
-            return this.activeChatYieldMs - (now - state.last_active_chat_at);
-          }
+            if (
+              trafficClass === "maintenance" &&
+              state.last_active_chat_at > 0 &&
+              now - state.last_active_chat_at < this.activeChatYieldMs
+            ) {
+              return this.activeChatYieldMs - (now - state.last_active_chat_at);
+            }
 
-          let rate =
-            trafficClass === "maintenance"
-              ? this.maintenanceRate
-              : this.interactiveRate;
-          if (endpointKey === "query-data-source") {
-            rate = Math.min(rate, QUERY_ENDPOINT_MAX_RATE);
-          }
-          const capacity = trafficClass === "maintenance" ? 1 : this.burst;
+            const globalRate =
+              trafficClass === "maintenance"
+                ? this.maintenanceRate
+                : this.interactiveRate;
+            const globalCapacity = trafficClass === "maintenance" ? 1 : this.burst;
 
-          const bucket = state.endpoints[endpointKey] ?? {
-            tokens: capacity,
-            last_refill_ms: now,
-            retry_after_until: 0,
-          };
+            const globalBucket = state.global ?? {
+              tokens: globalCapacity,
+              last_refill_ms: now,
+            };
+            const globalElapsedSec = Math.max(0, (now - globalBucket.last_refill_ms) / 1000);
+            const globalRefilled = Math.min(
+              globalCapacity,
+              globalBucket.tokens + globalElapsedSec * globalRate,
+            );
 
-          const elapsedSec = Math.max(0, (now - bucket.last_refill_ms) / 1000);
-          const refilled = Math.min(capacity, bucket.tokens + elapsedSec * rate);
+            if (globalRefilled < 1) {
+              const neededSec = (1 - globalRefilled) / globalRate;
+              return Math.max(25, Math.ceil(neededSec * 1000));
+            }
 
-          if (refilled < 1) {
-            const neededSec = (1 - refilled) / rate;
-            return Math.max(25, Math.ceil(neededSec * 1000));
-          }
+            // Enforce standalone <= 3.0 req/s cap on query-data-source even on Business/Enterprise.
+            const endpointRate =
+              endpointKey === "query-data-source"
+                ? Math.min(globalRate, QUERY_ENDPOINT_MAX_RATE)
+                : globalRate;
+            const endpointCapacity =
+              endpointKey === "query-data-source"
+                ? Math.min(globalCapacity, QUERY_ENDPOINT_MAX_RATE)
+                : globalCapacity;
 
-          bucket.tokens = refilled - 1;
-          bucket.last_refill_ms = now;
-          state.endpoints[endpointKey] = bucket;
-          state.updated_at = now;
-          if (trafficClass === "interactive") {
-            state.last_active_chat_at = now;
-          }
-          await this.writeStateUnlocked(state);
-          return 0;
-        },
-      );
+            const endpointBucket = state.endpoints[endpointKey] ?? {
+              tokens: endpointCapacity,
+              last_refill_ms: now,
+              retry_after_until: 0,
+            };
+            const epElapsedSec = Math.max(0, (now - endpointBucket.last_refill_ms) / 1000);
+            const epRefilled = Math.min(
+              endpointCapacity,
+              endpointBucket.tokens + epElapsedSec * endpointRate,
+            );
 
-      if (sleepMs <= 0) return;
-      await new Promise((r) => setTimeout(r, sleepMs));
+            if (endpointKey === "query-data-source" && epRefilled < 1) {
+              const neededSec = (1 - epRefilled) / endpointRate;
+              return Math.max(25, Math.ceil(neededSec * 1000));
+            }
+
+            state.global = {
+              tokens: globalRefilled - 1,
+              last_refill_ms: now,
+            };
+            state.endpoints[endpointKey] = {
+              tokens: Math.max(0, epRefilled - 1),
+              last_refill_ms: now,
+              retry_after_until: endpointBucket.retry_after_until,
+            };
+            state.updated_at = now;
+            if (trafficClass === "interactive") {
+              state.last_active_chat_at = now;
+            }
+            await this.writeStateUnlocked(state);
+            return 0;
+          },
+        );
+
+        if (sleepMs <= 0) return;
+        await new Promise((r) => setTimeout(r, sleepMs));
+      }
+    } catch (err) {
+      this.release(trafficClass);
+      throw err;
     }
   }
 
@@ -164,6 +254,9 @@ export class CrossProcessRateLimiter implements RateLimiter {
       } else {
         // Space-wide or integration-wide limit broadcasts globally to sibling CLI processes.
         state.retry_after_until = Math.max(state.retry_after_until, targetUntil);
+        if (state.global) {
+          state.global.tokens = 0;
+        }
       }
 
       await this.writeStateUnlocked(state);

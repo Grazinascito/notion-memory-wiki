@@ -67,29 +67,42 @@ export function wrapUntrustedContent(content: string, nonce: string): string {
 
 const UUID_DASHED_RE =
   /([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})/i;
-const UUID_COMPACT_RE = /([0-9a-f]{32})/i;
+const UUID_EXACT_RE =
+  /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32})$/i;
 
 /**
  * Extract a canonical dashed UUID from a Notion URL or raw 32/36-char ID.
+ * Strips query strings and hash fragments first so `?v=<view_id>` is never
+ * mistaken for the page or database ID.
  */
 export function extractNotionUuid(input: string): string | null {
-  const trimmed = input.trim();
-  const dashed = UUID_DASHED_RE.exec(trimmed);
+  const pathPart = (input.trim().split(/[?#]/)[0] ?? "").trim();
+  const dashed = UUID_DASHED_RE.exec(pathPart);
   if (dashed) {
     return `${dashed[1]}-${dashed[2]}-${dashed[3]}-${dashed[4]}-${dashed[5]}`.toLowerCase();
   }
-  const compactMatches = trimmed.match(/[0-9a-f]{32}/gi);
+  const compactMatches = pathPart.match(/[0-9a-f]{32}/gi);
   if (compactMatches && compactMatches.length > 0) {
-    // Notion URLs end with the page/database 32-hex ID before query params.
+    // Notion URLs end with the page/database 32-hex ID before query params or fragments.
     const raw = compactMatches[compactMatches.length - 1]!.toLowerCase();
     return `${raw.slice(0, 8)}-${raw.slice(8, 12)}-${raw.slice(12, 16)}-${raw.slice(16, 20)}-${raw.slice(20)}`;
   }
-  const fallback = UUID_COMPACT_RE.exec(trimmed);
-  if (fallback) {
-    const raw = fallback[1]!.toLowerCase();
-    return `${raw.slice(0, 8)}-${raw.slice(8, 12)}-${raw.slice(12, 16)}-${raw.slice(16, 20)}-${raw.slice(20)}`;
-  }
   return null;
+}
+
+/**
+ * Classify how a user/agent target input was supplied for PRD metrics tracking.
+ * Notion URLs (notion.so / notion.site) and raw pasted UUIDs count as "raw_url".
+ */
+export function classifyResolution(
+  target: string,
+  resolvedVia?: "alias" | "search" | "raw_url" | "fractal",
+): "alias" | "search" | "raw_url" | "fractal" {
+  const trimmed = target.trim();
+  if (/notion\.(?:so|site)/i.test(trimmed) || UUID_EXACT_RE.test(trimmed)) {
+    return "raw_url";
+  }
+  return resolvedVia ?? "alias";
 }
 
 /**

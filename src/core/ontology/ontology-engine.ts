@@ -1,7 +1,7 @@
 import { AxiError } from "../../shared/errors.js";
-import { normalizeNfd, trigramScore } from "../../shared/text.js";
+import { normalizeNfd, slugifyAlias, trigramScore } from "../../shared/text.js";
 import { estimateTokens, TOKEN_CAPS } from "../../shared/tokens.js";
-import type { CacheSnapshot, OntologyConfig } from "../../shared/types.js";
+import type { CacheSnapshot, GuidePageConfig, OntologyConfig } from "../../shared/types.js";
 import type { ScopeGuard } from "../scope/scope-guard.js";
 
 export interface ResolvedDatabase {
@@ -11,6 +11,12 @@ export interface ResolvedDatabase {
   purpose: string;
   score: number;
   resolvedVia: "alias" | "search";
+}
+
+export interface ResolvedGuidePage {
+  pageId: string;
+  alias: string;
+  title: string;
 }
 
 export interface RenderedLevel0 {
@@ -35,6 +41,43 @@ export interface CatalogEntry {
 const CLI_MICRO_CARD = [
   "CLI: `wiki catalog [--area <id>]` | `wiki query <alias> [--where Prop=Val] [--fields a,b] [--limit 20]` | `wiki read <id> [--full]` | `wiki sync`",
 ].join("\n");
+
+function buildGuideIndexEntries(
+  pages: GuidePageConfig[],
+): Array<{ alias: string; page: GuidePageConfig }> {
+  const used = new Set<string>();
+  return pages.map((page) => {
+    const base = slugifyAlias(page.title);
+    let alias = base;
+    let suffix = 2;
+    while (used.has(alias)) {
+      alias = `${base}_${suffix++}`;
+    }
+    used.add(alias);
+    return { alias, page };
+  });
+}
+
+function buildOverflowCatalogText(
+  workspaceName: string,
+  profileName: string,
+  areaSummaryLines: string[],
+  pinned: CatalogEntry[],
+): string {
+  const lines = [
+    `## Notion Memory Wiki (${workspaceName} | profile: ${profileName})`,
+    CLI_MICRO_CARD,
+    "### Areas (run `wiki catalog --area <id>` to expand)",
+    ...areaSummaryLines,
+  ];
+  if (pinned.length > 0) {
+    lines.push("### Pinned Databases");
+    for (const p of pinned) {
+      lines.push(`- ${p.alias} | ${p.area} | ${p.purpose}`);
+    }
+  }
+  return lines.join("\n");
+}
 
 export class OntologyEngine {
   constructor(private readonly scopeGuard: ScopeGuard) {}
@@ -107,6 +150,38 @@ export class OntologyEngine {
     return best;
   }
 
+  /**
+   * Resolve a guide short alias (or page UUID) from ontology.yaml outside the LLM prompt,
+   * enforcing allow_guide_pages scope for the active profile.
+   */
+  resolveGuidePage(
+    ontology: OntologyConfig,
+    profileName: string,
+    aliasOrId: string,
+  ): ResolvedGuidePage | null {
+    const normInput = normalizeNfd(aliasOrId);
+    const entries = buildGuideIndexEntries(ontology.guide.pages);
+    for (const entry of entries) {
+      if (
+        normalizeNfd(entry.alias) === normInput ||
+        entry.page.page_id.toLowerCase() === aliasOrId.trim().toLowerCase()
+      ) {
+        if (!this.scopeGuard.isGuidePageAllowed(ontology, profileName, entry.page.page_id)) {
+          throw new AxiError(
+            "SCOPE_DENIED",
+            `Profile "${profileName}" is not authorized to read guide page "${entry.page.title}".`,
+          );
+        }
+        return {
+          pageId: entry.page.page_id,
+          alias: entry.alias,
+          title: entry.page.title,
+        };
+      }
+    }
+    return null;
+  }
+
   listCatalog(
     ontology: OntologyConfig,
     cache: CacheSnapshot | null,
@@ -131,7 +206,8 @@ export class OntologyEngine {
   }
 
   /**
-   * Render Level 0 Push block / wakeup text strictly under Section 4.1 & 4.2 caps.
+   * Render Level 0 Push block / wakeup text strictly under Section 4.1 & 4.2 caps,
+   * with zero raw Notion UUIDs in the output.
    */
   renderLevel0(
     ontology: OntologyConfig,
@@ -164,29 +240,43 @@ export class OntologyEngine {
         byArea.set(e.area, list);
       }
       const areaMeta = new Map(ontology.taxonomy.map((t) => [t.id, t]));
+      const areaSummaryLines = [...byArea.entries()].map(([areaId, list]) => {
+        const label = areaMeta.get(areaId)?.label ?? areaId;
+        const sample = list
+          .slice(0, 3)
+          .map((x) => x.alias)
+          .join(", ");
+        return `- ${areaId} | ${label} | ${list.length} DBs | ${sample}`;
+      });
       const pinned = entries.filter((e) => e.pinned).slice(0, 5);
 
-      const areaLines = [
-        `## Notion Memory Wiki (${ontology.workspace.name} | profile: ${profileName})`,
-        CLI_MICRO_CARD,
-        "### Areas (run `wiki catalog --area <id>` to expand)",
-        ...[...byArea.entries()].map(([areaId, list]) => {
-          const label = areaMeta.get(areaId)?.label ?? areaId;
-          const sample = list
-            .slice(0, 3)
-            .map((x) => x.alias)
-            .join(", ");
-          return `- ${areaId} | ${label} | ${list.length} DBs | ${sample}`;
-        }),
-      ];
-      if (pinned.length > 0) {
-        areaLines.push("### Pinned Databases");
-        for (const p of pinned) {
-          areaLines.push(`- ${p.alias} | ${p.area} | ${p.purpose}`);
-        }
-      }
-      catalogText = areaLines.join("\n");
+      catalogText = buildOverflowCatalogText(
+        ontology.workspace.name,
+        profileName,
+        areaSummaryLines,
+        pinned,
+      );
       catalogTokens = estimateTokens(catalogText);
+
+      // Trim pinned databases first to satisfy CATALOG_HARD post-overflow.
+      while (pinned.length > 0 && catalogTokens > TOKEN_CAPS.CATALOG_HARD) {
+        pinned.pop();
+        catalogText = buildOverflowCatalogText(
+          ontology.workspace.name,
+          profileName,
+          areaSummaryLines,
+          pinned,
+        );
+        catalogTokens = estimateTokens(catalogText);
+      }
+
+      if (catalogTokens > TOKEN_CAPS.CATALOG_HARD) {
+        throw new AxiError(
+          "BUDGET_EXCEEDED",
+          `Catalog is ${catalogTokens} tok after overflow summary, exceeding hard cap of ${TOKEN_CAPS.CATALOG_HARD} tok.`,
+          ["Shorten taxonomy area labels or reduce pinned_level0 databases in ontology.yaml."],
+        );
+      }
     }
 
     if (catalogTokens > TOKEN_CAPS.CATALOG_WARN) {
@@ -195,23 +285,23 @@ export class OntologyEngine {
       );
     }
 
-    // Guide section filtered by allow_guide_pages.
+    // Guide section filtered by allow_guide_pages, using short aliases with zero UUIDs.
     let guideText = "";
     if (ontology.guide.enabled) {
-      const allowedPages = ontology.guide.pages.filter((p) =>
-        this.scopeGuard.isGuidePageAllowed(ontology, profileName, p.page_id),
+      const allowedEntries = buildGuideIndexEntries(ontology.guide.pages).filter((e) =>
+        this.scopeGuard.isGuidePageAllowed(ontology, profileName, e.page.page_id),
       );
       const parts: string[] = [];
       if (guideSummary?.trim()) {
         parts.push("### Operating Guide Summary");
         parts.push(guideSummary.trim());
       }
-      if (allowedPages.length > 0) {
-        parts.push("### Guide Pages (open on demand via `wiki read <id>`)");
-        for (const page of allowedPages) {
-          const cached = cache?.guide_pages.find((g) => g.page_id === page.page_id);
+      if (allowedEntries.length > 0) {
+        parts.push("### Guide Pages (open on demand via `wiki read <alias>`)");
+        for (const entry of allowedEntries) {
+          const cached = cache?.guide_pages.find((g) => g.page_id === entry.page.page_id);
           const staleTag = cached?.summary_stale ? " [stale]" : "";
-          parts.push(`- ${page.title}${staleTag} (${page.page_id}): ${page.open_when}`);
+          parts.push(`- ${entry.alias} | ${entry.page.title}${staleTag}: ${entry.page.open_when}`);
         }
       }
       guideText = parts.join("\n");

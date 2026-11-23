@@ -4,12 +4,17 @@ import type {
   CacheSnapshot,
   FractalPointers,
   NotionParent,
+  NotionPropertyValue,
   OntologyConfig,
 } from "../../shared/types.js";
 import type { NotionGateway } from "../ports.js";
 
 const MAX_PARENT_WALK_HOPS = 4;
 export const REDACTED_MARKER = "[REDACTED:SCOPE_DENIED]";
+
+function scopeCacheKey(profileName: string, targetId: string): string {
+  return `${profileName}:${targetId}`;
+}
 
 export class ScopeGuard {
   private readonly verifiedInRoot = new Set<string>();
@@ -69,6 +74,7 @@ export class ScopeGuard {
   /**
    * Exact set-algebra scope formula:
    * Permitted = (DatabasesIn(allow_areas) U allow_databases) \ deny_databases
+   * "*" in allow_areas expands only to confirmed taxonomy areas (never area === "").
    */
   getPermittedAliases(ontology: OntologyConfig, profileName: string): Set<string> {
     const scope = ontology.agent_scopes[profileName];
@@ -79,6 +85,7 @@ export class ScopeGuard {
     const allAliases = Object.keys(ontology.databases);
     const allowAllAreas = scope.allow_areas.includes("*");
     const allowAllDbs = scope.allow_databases.includes("*");
+    const confirmedAreas = new Set(ontology.taxonomy.map((t) => t.id));
     const allowedAreas = new Set(scope.allow_areas);
     const explicitAllowedDbs = new Set(scope.allow_databases);
     const deniedDbs = new Set(scope.deny_databases);
@@ -86,7 +93,9 @@ export class ScopeGuard {
     const permitted = new Set<string>();
     for (const alias of allAliases) {
       const db = ontology.databases[alias]!;
-      const inArea = allowAllAreas || (db.area !== "" && allowedAreas.has(db.area));
+      const inArea =
+        db.area !== "" &&
+        (allowAllAreas ? confirmedAreas.has(db.area) : allowedAreas.has(db.area));
       const inExplicit = allowAllDbs || explicitAllowedDbs.has(alias);
       if ((inArea || inExplicit) && !deniedDbs.has(alias)) {
         permitted.add(alias);
@@ -163,18 +172,30 @@ export class ScopeGuard {
    * - Strips rollups whose underlying relation targets an out-of-scope data_source_id.
    * - Redacts formulas referencing any stripped rollup or blocked relation property.
    * - Redacts relation values pointing to a blocked data_source_id.
+   * - Fails closed when schema metadata is missing (strips rollups, redacts relations & formulas).
    */
   filterRecordProperties(
     ontology: OntologyConfig,
     cache: CacheSnapshot | null,
     profileName: string,
     dataSourceId: string,
-    rawProperties: Record<string, Record<string, unknown>>,
-  ): Record<string, Record<string, unknown> | string> {
+    rawProperties: Record<string, NotionPropertyValue>,
+  ): Record<string, NotionPropertyValue | string> {
     const permittedDs = this.getPermittedDataSourceIds(ontology, profileName);
     const cachedDs = cache?.data_sources[dataSourceId];
     if (!cachedDs) {
-      return rawProperties;
+      const failClosed: Record<string, NotionPropertyValue | string> = {};
+      for (const [propName, propVal] of Object.entries(rawProperties)) {
+        if (propVal.type === "rollup") {
+          continue;
+        }
+        if (propVal.type === "relation" || propVal.type === "formula") {
+          failClosed[propName] = REDACTED_MARKER;
+          continue;
+        }
+        failClosed[propName] = propVal;
+      }
+      return failClosed;
     }
 
     const propSchemasByName = new Map(
@@ -203,10 +224,9 @@ export class ScopeGuard {
       }
     }
 
-    const out: Record<string, Record<string, unknown> | string> = {};
+    const out: Record<string, NotionPropertyValue | string> = {};
     for (const [propName, propVal] of Object.entries(rawProperties)) {
       if (strippedRollupNames.has(propName)) {
-        // Strip rollup leaking values from out-of-scope database.
         continue;
       }
       if (blockedRelationNames.has(propName)) {
@@ -235,7 +255,7 @@ export class ScopeGuard {
 
   /**
    * Verify that a raw Notion page/database UUID is inside workspace.root_id
-   * or an approved database, bounded to at most 4 upward GET calls.
+   * or an approved database for the given profile, bounded to at most 4 GET calls total.
    */
   async verifyUuidInRootScope(
     ontology: OntologyConfig,
@@ -245,12 +265,63 @@ export class ScopeGuard {
     profileName: string,
     targetId: string,
   ): Promise<void> {
+    const scope = ontology.agent_scopes[profileName];
+    if (!scope) {
+      throw new AxiError("SCOPE_DENIED", `Unknown profile "${profileName}".`);
+    }
+
     const rootId = ontology.workspace.root_id;
     const permittedDs = this.getPermittedDataSourceIds(ontology, profileName);
+    const allowAllAreas = scope.allow_areas.includes("*");
+    const allowedAreas = new Set(scope.allow_areas);
+
+    const permittedHubIds = new Set<string>();
+    const blockedHubIds = new Set<string>();
+    for (const area of ontology.taxonomy) {
+      if (allowAllAreas || allowedAreas.has(area.id)) {
+        permittedHubIds.add(area.hub_page_id);
+      } else {
+        blockedHubIds.add(area.hub_page_id);
+      }
+    }
+
+    const blockedDataSourceIds = new Set<string>(ontology.excluded_data_source_ids);
+    for (const db of Object.values(ontology.databases)) {
+      if (!permittedDs.has(db.data_source_id)) {
+        blockedDataSourceIds.add(db.data_source_id);
+      }
+    }
+    const blockedDatabaseIds = new Set<string>();
+    for (const cached of Object.values(cache?.data_sources ?? {})) {
+      if (!permittedDs.has(cached.data_source_id)) {
+        blockedDatabaseIds.add(cached.database_id);
+      }
+    }
+
+    // Fail closed immediately on any target explicitly excluded or outside profile scope.
+    if (blockedDataSourceIds.has(targetId) || blockedDatabaseIds.has(targetId)) {
+      throw new AxiError(
+        "SCOPE_DENIED",
+        `Target "${targetId}" is excluded or outside profile "${profileName}" scope.`,
+      );
+    }
+    if (blockedHubIds.has(targetId)) {
+      throw new AxiError(
+        "SCOPE_DENIED",
+        `Hub "${targetId}" is outside profile "${profileName}" allow_areas scope.`,
+      );
+    }
+    const guidePage = ontology.guide.pages.find((g) => g.page_id === targetId);
+    if (guidePage && !this.isGuidePageAllowed(ontology, profileName, targetId)) {
+      throw new AxiError(
+        "SCOPE_DENIED",
+        `Profile "${profileName}" is not authorized to read guide page "${guidePage.title}".`,
+      );
+    }
+
     const knownAllowedIds = new Set<string>([
       rootId,
-      ...ontology.workspace.approved_linked_view_ids,
-      ...ontology.taxonomy.map((t) => t.hub_page_id),
+      ...permittedHubIds,
       ...ontology.guide.pages
         .filter((g) => this.isGuidePageAllowed(ontology, profileName, g.page_id))
         .map((g) => g.page_id),
@@ -264,50 +335,48 @@ export class ScopeGuard {
       if (cached?.database_id) knownAllowedIds.add(cached.database_id);
     }
     for (const [parentId, children] of Object.entries(fractals.by_parent_page_id)) {
-      knownAllowedIds.add(parentId);
-      for (const child of children) {
-        knownAllowedIds.add(child.child_database_id);
-        knownAllowedIds.add(child.child_data_source_id);
+      const parentAuthorized =
+        knownAllowedIds.has(parentId) ||
+        this.verifiedInRoot.has(scopeCacheKey(profileName, parentId));
+      if (parentAuthorized) {
+        knownAllowedIds.add(parentId);
+        for (const child of children) {
+          knownAllowedIds.add(child.child_database_id);
+          knownAllowedIds.add(child.child_data_source_id);
+        }
+      } else {
+        for (const child of children) {
+          if (permittedDs.has(child.child_data_source_id)) {
+            knownAllowedIds.add(child.child_database_id);
+            knownAllowedIds.add(child.child_data_source_id);
+          }
+        }
       }
     }
 
-    if (knownAllowedIds.has(targetId) || this.verifiedInRoot.has(targetId)) {
+    if (
+      knownAllowedIds.has(targetId) ||
+      this.verifiedInRoot.has(scopeCacheKey(profileName, targetId))
+    ) {
       return;
     }
 
-    // Check if target is an explicitly excluded or out-of-scope database/guide page.
-    if (ontology.excluded_data_source_ids.includes(targetId)) {
-      throw new AxiError(
-        "SCOPE_DENIED",
-        `Target "${targetId}" is excluded in ontology.yaml.`,
-      );
-    }
-    const guidePage = ontology.guide.pages.find((g) => g.page_id === targetId);
-    if (guidePage && !this.isGuidePageAllowed(ontology, profileName, targetId)) {
-      throw new AxiError(
-        "SCOPE_DENIED",
-        `Profile "${profileName}" is not authorized to read guide page "${guidePage.title}".`,
-      );
-    }
-
-    // Walk parent chain upward for at most 4 GET calls.
+    // Walk parent chain upward sharing a strict max budget of 4 GET calls total.
     let currentId = targetId;
-    for (let hop = 0; hop < MAX_PARENT_WALK_HOPS; hop += 1) {
+    let getsUsed = 0;
+    while (getsUsed < MAX_PARENT_WALK_HOPS) {
+      getsUsed += 1;
       const page = await notion.getPage(currentId);
       const parent = page.parent;
       const parentId = extractParentId(parent);
       if (!parentId) break;
 
       if (parent.type === "data_source_id") {
-        // Record inside a database: enforce Agent Scope on that data_source_id.
         if (permittedDs.has(parent.data_source_id)) {
-          this.verifiedInRoot.add(targetId);
+          this.verifiedInRoot.add(scopeCacheKey(profileName, targetId));
           return;
         }
-        const isKnownDb = Object.values(ontology.databases).some(
-          (db) => db.data_source_id === parent.data_source_id,
-        );
-        if (isKnownDb) {
+        if (blockedDataSourceIds.has(parent.data_source_id)) {
           throw new AxiError(
             "SCOPE_DENIED",
             `Page "${targetId}" belongs to a database outside profile "${profileName}" scope.`,
@@ -315,19 +384,28 @@ export class ScopeGuard {
         }
       }
 
-      if (knownAllowedIds.has(parentId) || this.verifiedInRoot.has(parentId)) {
-        this.verifiedInRoot.add(targetId);
+      if (blockedHubIds.has(parentId)) {
+        throw new AxiError(
+          "SCOPE_DENIED",
+          `Page "${targetId}" is inside a hub outside profile "${profileName}" scope.`,
+        );
+      }
+
+      if (
+        knownAllowedIds.has(parentId) ||
+        this.verifiedInRoot.has(scopeCacheKey(profileName, parentId))
+      ) {
+        this.verifiedInRoot.add(scopeCacheKey(profileName, targetId));
         return;
       }
 
       if (parent.type === "database_id") {
-        // Check if parent database container belongs to an authorized data source or root.
         const matchingDs = Object.values(cache?.data_sources ?? {}).find(
           (ds) => ds.database_id === parent.database_id,
         );
         if (matchingDs) {
           if (permittedDs.has(matchingDs.data_source_id)) {
-            this.verifiedInRoot.add(targetId);
+            this.verifiedInRoot.add(scopeCacheKey(profileName, targetId));
             return;
           }
           throw new AxiError(
@@ -335,10 +413,35 @@ export class ScopeGuard {
             `Page "${targetId}" belongs to a database outside profile "${profileName}" scope.`,
           );
         }
+        if (getsUsed >= MAX_PARENT_WALK_HOPS) break;
+        getsUsed += 1;
         const db = await notion.getDatabase(parent.database_id);
+        const dbDsId = db.data_sources?.[0]?.id;
+        if (dbDsId) {
+          if (permittedDs.has(dbDsId)) {
+            this.verifiedInRoot.add(scopeCacheKey(profileName, targetId));
+            return;
+          }
+          if (blockedDataSourceIds.has(dbDsId)) {
+            throw new AxiError(
+              "SCOPE_DENIED",
+              `Page "${targetId}" belongs to a database outside profile "${profileName}" scope.`,
+            );
+          }
+        }
         const dbParentId = extractParentId(db.parent);
-        if (dbParentId && knownAllowedIds.has(dbParentId)) {
-          this.verifiedInRoot.add(targetId);
+        if (dbParentId && blockedHubIds.has(dbParentId)) {
+          throw new AxiError(
+            "SCOPE_DENIED",
+            `Page "${targetId}" is inside a hub outside profile "${profileName}" scope.`,
+          );
+        }
+        if (
+          dbParentId &&
+          (knownAllowedIds.has(dbParentId) ||
+            this.verifiedInRoot.has(scopeCacheKey(profileName, dbParentId)))
+        ) {
+          this.verifiedInRoot.add(scopeCacheKey(profileName, targetId));
           return;
         }
         if (!dbParentId) break;
@@ -351,7 +454,7 @@ export class ScopeGuard {
 
     throw new AxiError(
       "OUT_OF_ROOT_SCOPE",
-      `Target "${targetId}" could not be verified as a descendant of Root Page within ${MAX_PARENT_WALK_HOPS} hops.`,
+      `Target "${targetId}" could not be verified as a descendant of Root Page within ${MAX_PARENT_WALK_HOPS} GET calls.`,
       ["Ensure the page is inside your configured Root Page or run `wiki sync`."],
     );
   }

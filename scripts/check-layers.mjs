@@ -51,6 +51,7 @@ function resolveLayer(fromFile, spec) {
 for (const file of walk(rootDir)) {
   const relFile = path.relative(rootDir, file);
   const layer = relFile.split(path.sep)[0];
+  const infraAdapter = layer === "infra" ? relFile.split(path.sep)[1] : null;
   const content = fs.readFileSync(file, "utf8");
   const specs = extractSpecifiers(content);
 
@@ -63,19 +64,20 @@ for (const file of walk(rootDir)) {
 
   for (const spec of specs) {
     const target = resolveLayer(file, spec);
+    const isNodeFs = target.kind === "node" && (target.spec === "node:fs" || target.spec.startsWith("node:fs/"));
 
     if (layer === "shared") {
       if (target.kind === "local" && target.layer !== "shared") {
         violations.push(`${relFile}: src/shared/ may only import src/shared/ (found ${spec})`);
       }
-      if (target.kind === "node" && target.spec === "node:fs") {
-        violations.push(`${relFile}: src/shared/ forbids node:fs (found ${spec})`);
+      if (isNodeFs) {
+        violations.push(`${relFile}: src/shared/ forbids node:fs and node:fs/* (found ${spec})`);
       }
     }
 
     if (layer === "core") {
-      if (target.kind === "node" && target.spec === "node:fs") {
-        violations.push(`${relFile}: src/core/ forbids node:fs (found ${spec})`);
+      if (isNodeFs) {
+        violations.push(`${relFile}: src/core/ forbids node:fs and node:fs/* (found ${spec})`);
       }
       if (target.kind === "local" && target.layer !== "core" && target.layer !== "shared") {
         violations.push(`${relFile}: src/core/ may only import src/core/ and src/shared/ (found ${spec})`);
@@ -84,13 +86,18 @@ for (const file of walk(rootDir)) {
 
     if (layer === "infra") {
       if (target.kind === "local") {
+        const normalizedRel = target.rel.split(path.sep).join("/");
+        const sameAdapter =
+          infraAdapter !== null && normalizedRel.startsWith(`infra/${infraAdapter}/`);
+        const sharedPosixFs = normalizedRel.startsWith("infra/fs/");
         const allowed =
-          target.layer === "infra" ||
           target.layer === "shared" ||
-          target.rel === "core/ports.ts";
+          normalizedRel === "core/ports.ts" ||
+          sameAdapter ||
+          sharedPosixFs;
         if (!allowed) {
           violations.push(
-            `${relFile}: src/infra/ may only import src/infra/, src/shared/, or src/core/ports.ts (found ${spec})`,
+            `${relFile}: src/infra/${infraAdapter}/ may only import src/core/ports.ts, src/shared/, src/infra/fs/, or its own adapter dir (found ${spec})`,
           );
         }
       }

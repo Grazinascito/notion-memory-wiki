@@ -8,9 +8,19 @@ import {
   atomicWriteFile,
   ensureSecureDir,
   expandUserPath,
-} from "../storage/json-metadata-store.js";
+} from "../fs/posix-fs.js";
 
 const execFileAsync = promisify(execFile);
+const VALID_PROFILE_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
+
+function assertValidProfile(profile: string): void {
+  if (!VALID_PROFILE_RE.test(profile)) {
+    throw new AxiError(
+      "INVALID_ARGUMENT",
+      `Invalid profile name "${profile}". Expected 1-64 alphanumeric, "_" or "-" characters.`,
+    );
+  }
+}
 
 export class TokenProvider implements SecretStore {
   private readonly wikiHome: string;
@@ -36,6 +46,7 @@ export class TokenProvider implements SecretStore {
   }
 
   async storeTokenFile(profile: string, token: string): Promise<string> {
+    assertValidProfile(profile);
     const tokensDir = path.join(this.wikiHome, "tokens");
     await ensureSecureDir(tokensDir);
     const tokenPath = path.join(tokensDir, `${profile}.token`);
@@ -46,8 +57,9 @@ export class TokenProvider implements SecretStore {
   async resolveToken(options: {
     profile: string;
     tokenRef?: string;
-    envVar?: string;
   }): Promise<{ token: string; source: "keychain" | "token_file" | "env" }> {
+    assertValidProfile(options.profile);
+
     // 1. OS Keychain (macOS Keychain when tokenRef starts with "keychain:")
     if (options.tokenRef?.startsWith("keychain:")) {
       const service = options.tokenRef.slice("keychain:".length);
@@ -55,15 +67,18 @@ export class TokenProvider implements SecretStore {
       if (kc) return { token: kc, source: "keychain" };
     }
 
-    // 2. 0o600 token file (explicit token_ref path or default $WIKI_HOME/tokens/<profile>.token)
+    // 2. 0o600 token file: explicit token_ref path, or profile-scoped file when no token_ref is set.
+    // Never fall back to default.token for non-default profiles or profiles with an explicit token_ref.
     const candidateFiles: string[] = [];
-    if (options.tokenRef && !options.tokenRef.startsWith("keychain:")) {
-      candidateFiles.push(expandUserPath(options.tokenRef));
+    if (options.tokenRef) {
+      if (!options.tokenRef.startsWith("keychain:")) {
+        candidateFiles.push(expandUserPath(options.tokenRef));
+      }
+    } else {
+      candidateFiles.push(
+        path.join(this.wikiHome, "tokens", `${options.profile}.token`),
+      );
     }
-    candidateFiles.push(
-      path.join(this.wikiHome, "tokens", `${options.profile}.token`),
-    );
-    candidateFiles.push(path.join(this.wikiHome, "tokens", "default.token"));
 
     for (const filePath of candidateFiles) {
       try {
@@ -77,8 +92,7 @@ export class TokenProvider implements SecretStore {
     }
 
     // 3. Environment variable (headless/cron fallback)
-    const envName = options.envVar ?? "NOTION_TOKEN";
-    const envToken = process.env[envName]?.trim();
+    const envToken = process.env.NOTION_TOKEN?.trim();
     if (envToken) {
       return { token: envToken, source: "env" };
     }
@@ -87,7 +101,7 @@ export class TokenProvider implements SecretStore {
       "TOKEN_MISSING",
       `No Notion integration token found for profile "${options.profile}".`,
       [
-        `Save a 0o600 token file at ${path.join(this.wikiHome, "tokens", `${options.profile}.token`)}, add macOS Keychain entry, or export ${envName}.`,
+        `Save a 0o600 token file at ${path.join(this.wikiHome, "tokens", `${options.profile}.token`)}, add macOS Keychain entry, or export NOTION_TOKEN.`,
       ],
     );
   }

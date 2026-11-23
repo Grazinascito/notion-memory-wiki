@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import readline from "node:readline/promises";
+import type { SyncService } from "../core/sync/sync-service.js";
 import { AxiError } from "../shared/errors.js";
+import { classifyResolution } from "../shared/text.js";
+import type { MetricEvent } from "../shared/types.js";
 import { bootstrapApp } from "./bootstrap.js";
 import {
   formatCatalogToon,
@@ -29,6 +32,7 @@ function parseArgv(argv: string[]): ParsedArgs {
     "--area",
     "--where",
     "--fields",
+    "--follow",
     "--limit",
     "--cursor",
     "--offset",
@@ -77,21 +81,35 @@ function printHelp(): void {
       "",
       "Commands:",
       "  wiki auth set [--profile <name>]                   Save Notion token into 0o600 token file",
-      "  wiki setup <root-url-or-id> [--name <w>] [--render-target <path>] [--scan-only]",
+      "  wiki setup <root-url-or-id> [--name <w>] [--render-target <path>] [--scan-only] [--allow-pat]",
       "  wiki sync [--no-render]                            Refresh cache.json from Notion (Notion wins)",
       "  wiki render [--profile <name>]                     Write bounded Level 0 Push block to render_target",
       "  wiki wakeup [--profile <name>]                     Print Level 0 context to stdout (for hooks/on-demand)",
       "  wiki catalog [--area <id>] [--profile <name>]      List permitted databases (Level 1a)",
-      "  wiki query <alias> [--where K=V] [--fields a,b] [--limit 20] [--profile <name>]",
-      "  wiki read <page-id-or-url> [--full] [--offset N] [--profile <name>]",
+      "  wiki query <alias> [--where K=V] [--fields a,b] [--follow <rel>] [--limit 20] [--profile <name>]",
+      "  wiki read <page-id-url-or-alias> [--full] [--offset N] [--profile <name>]",
     ].join("\n"),
   );
 }
 
+function mapErrorOutcome(axi: AxiError | null): MetricEvent["outcome"] {
+  if (!axi) return "error";
+  if (
+    axi.code === "SCOPE_DENIED" ||
+    axi.code === "SCOPE_LOCKED" ||
+    axi.code === "OUT_OF_ROOT_SCOPE"
+  ) {
+    return "scope_denied";
+  }
+  if (axi.code === "RATE_LIMITED") return "http_429";
+  if (axi.code === "VALIDATION_ERROR") return "validation_error";
+  return "error";
+}
+
 async function run(): Promise<void> {
   const startedAt = Date.now();
-  const parsed = parseArgv(process.argv);
   const app = bootstrapApp();
+  const parsed = parseArgv(process.argv);
 
   const envProfile = process.env.WIKI_AGENT_PROFILE;
   const cliProfile = firstFlag(parsed, "--profile");
@@ -101,135 +119,139 @@ async function run(): Promise<void> {
     return;
   }
 
-  if (parsed.command === "auth") {
-    const sub = parsed.positionals[0];
-    if (sub !== "set") {
-      throw new AxiError("INVALID_ARGUMENT", "Usage: wiki auth set [--profile <name>]");
-    }
-    const profile = cliProfile ?? envProfile ?? "default";
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stderr,
-    });
-    try {
-      const token = (await rl.question(`Notion internal integration token for "${profile}": `)).trim();
-      if (!token) {
-        throw new AxiError("INVALID_ARGUMENT", "Token cannot be empty.");
-      }
-      const savedPath = await app.secrets.storeTokenFile(profile, token);
-      console.log(`auth ok profile=${profile} file=${savedPath} mode=0600`);
-    } finally {
-      rl.close();
-    }
-    return;
-  }
-
-  if (parsed.command === "setup") {
-    const rootArg = parsed.positionals[0];
-    if (!rootArg) {
-      throw new AxiError("INVALID_ARGUMENT", "Usage: wiki setup <root-url-or-id>");
-    }
-    const profileName = cliProfile ?? envProfile ?? "default";
-    const { token } = await app.secrets.resolveToken({ profile: profileName });
-    const syncService = app.createSyncService(token);
-    const scanOnly = parsed.booleans.has("--scan-only");
-    const result = await syncService.setupWorkspace({
-      rootUrlOrId: rootArg,
-      workspaceName: firstFlag(parsed, "--name"),
-      profileName,
-      renderTarget: firstFlag(parsed, "--render-target"),
-      apply: !scanOnly,
-    });
-    console.log(formatSetupToon(result, !scanOnly));
-    await app.metrics.append({
-      ts: new Date().toISOString(),
-      profile: profileName,
-      command: "setup",
-      target_alias: null,
-      resolved_via: "none",
-      outcome: "ok",
-      error_code: null,
-      http_status: 200,
-      notion_calls: result.apiCalls,
-      duration_ms: Date.now() - startedAt,
-    });
-    return;
-  }
-
-  // All remaining commands require an initialized ontology.yaml.
-  const ontology = await app.store.readOntology();
-  const { profileName, scope } = app.scopeGuard.resolveProfile(
-    ontology,
-    envProfile,
-    cliProfile,
-  );
+  let activeProfile = cliProfile?.trim() || envProfile?.trim() || "unresolved";
+  let activeSyncService: SyncService | null = null;
+  let activeResolvedVia: MetricEvent["resolved_via"] = "none";
 
   try {
-    if (parsed.command === "catalog") {
-      const cache = await app.store.readCache();
-      const entries = app.ontologyEngine.listCatalog(
-        ontology,
-        cache,
+    if (parsed.command === "auth") {
+      const sub = parsed.positionals[0];
+      if (sub !== "set") {
+        throw new AxiError("INVALID_ARGUMENT", "Usage: wiki auth set [--profile <name>]");
+      }
+      const profile = cliProfile ?? envProfile ?? "default";
+      activeProfile = profile;
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stderr,
+      });
+      try {
+        const token = (
+          await rl.question(`Notion internal integration token for "${profile}": `)
+        ).trim();
+        if (!token) {
+          throw new AxiError("INVALID_ARGUMENT", "Token cannot be empty.");
+        }
+        const savedPath = await app.secrets.storeTokenFile(profile, token);
+        console.log(`auth ok profile=${profile} file=${savedPath} mode=0600`);
+      } finally {
+        rl.close();
+      }
+      return;
+    }
+
+    if (parsed.command === "setup") {
+      const rootArg = parsed.positionals[0];
+      if (!rootArg) {
+        throw new AxiError("INVALID_ARGUMENT", "Usage: wiki setup <root-url-or-id>");
+      }
+      const profileName = cliProfile ?? envProfile ?? "default";
+      activeProfile = profileName;
+      activeResolvedVia = classifyResolution(rootArg);
+      const { token } = await app.secrets.resolveToken({ profile: profileName });
+      const syncService = app.createSyncService(token);
+      activeSyncService = syncService;
+      const scanOnly = parsed.booleans.has("--scan-only");
+      const result = await syncService.setupWorkspace({
+        rootUrlOrId: rootArg,
+        workspaceName: firstFlag(parsed, "--name"),
         profileName,
-        firstFlag(parsed, "--area"),
-      );
+        renderTarget: firstFlag(parsed, "--render-target"),
+        apply: !scanOnly,
+        allowPat: parsed.booleans.has("--allow-pat"),
+      });
+      console.log(formatSetupToon(result, !scanOnly));
+      await app.metrics.append({
+        ts: new Date().toISOString(),
+        profile: profileName,
+        command: "setup",
+        target_alias: null,
+        resolved_via: activeResolvedVia,
+        outcome: "ok",
+        error_code: null,
+        http_status: 200,
+        notion_calls: result.apiCalls,
+        duration_ms: Date.now() - startedAt,
+      });
+      return;
+    }
+
+    // All remaining commands require an initialized ontology.yaml and fail-closed profile resolution.
+    const ontology = await app.store.readOntology();
+    const { profileName, scope } = app.scopeGuard.resolveProfile(
+      ontology,
+      envProfile,
+      cliProfile,
+    );
+    activeProfile = profileName;
+
+    if (parsed.command === "catalog") {
+      const areaFilter = firstFlag(parsed, "--area");
+      const entries = await app.renderService.listCatalog(profileName, areaFilter);
       console.log(formatCatalogToon(entries));
+      await app.metrics.append({
+        ts: new Date().toISOString(),
+        profile: profileName,
+        command: "catalog",
+        target_alias: areaFilter ?? null,
+        resolved_via: "none",
+        outcome: "ok",
+        error_code: null,
+        http_status: null,
+        notion_calls: 0,
+        duration_ms: Date.now() - startedAt,
+      });
       return;
     }
 
     if (parsed.command === "wakeup") {
-      const cache = await app.store.readCache();
-      const guide = ontology.guide.enabled
-        ? await app.store.readGuideSummary(ontology.guide.summary_file)
-        : null;
-      const rendered = app.ontologyEngine.renderLevel0(
-        ontology,
-        cache,
-        guide,
-        profileName,
-      );
+      const rendered = await app.renderService.wakeupProfile(profileName);
       console.log(rendered.text);
+      await app.metrics.append({
+        ts: new Date().toISOString(),
+        profile: profileName,
+        command: "wakeup",
+        target_alias: null,
+        resolved_via: "none",
+        outcome: "ok",
+        error_code: null,
+        http_status: null,
+        notion_calls: 0,
+        duration_ms: Date.now() - startedAt,
+      });
       return;
     }
 
     if (parsed.command === "render") {
-      if (scope.injection_mode !== "render") {
-        throw new AxiError(
-          "DUPLICATE_INJECTION_MODE",
-          `Profile "${profileName}" uses injection_mode="${scope.injection_mode}", not "render".`,
-          ['Update injection_mode to "render" in ontology.yaml or use `wiki wakeup`.'],
-        );
-      }
-      if (!scope.render_target) {
-        throw new AxiError(
-          "CONFIG_INVALID",
-          `Profile "${profileName}" has injection_mode="render" but no render_target set.`,
-        );
-      }
-      const cache = await app.store.readCache();
-      const guide = ontology.guide.enabled
-        ? await app.store.readGuideSummary(ontology.guide.summary_file)
-        : null;
-      const rendered = app.ontologyEngine.renderLevel0(
-        ontology,
-        cache,
-        guide,
-        profileName,
-      );
-      const existing = await app.store.readExternalFile(scope.render_target);
-      const updated = app.ontologyEngine.upsertRenderBlock(
-        existing,
-        ontology.workspace.name,
-        profileName,
-        rendered.text,
-      );
-      await app.store.writeExternalFile(scope.render_target, updated);
+      const rendered = await app.renderService.renderProfile(profileName);
       console.log(
-        `render ok profile=${profileName} target=${scope.render_target} tokens=${rendered.totalTokens} overflow=${rendered.overflowActive}`,
+        `render ok profile=${rendered.profileName} target=${rendered.renderTarget} tokens=${rendered.totalTokens} overflow=${rendered.overflowActive}`,
       );
       for (const w of rendered.warnings) {
         console.log(`  warn: ${w}`);
       }
+      await app.metrics.append({
+        ts: new Date().toISOString(),
+        profile: profileName,
+        command: "render",
+        target_alias: null,
+        resolved_via: "none",
+        outcome: "ok",
+        error_code: null,
+        http_status: null,
+        notion_calls: 0,
+        duration_ms: Date.now() - startedAt,
+      });
       return;
     }
 
@@ -237,37 +259,13 @@ async function run(): Promise<void> {
       const { token } = await app.secrets.resolveToken({
         profile: profileName,
         tokenRef: scope.token_ref,
-        envVar: scope.notion_token_env,
       });
       const syncService = app.createSyncService(token);
-      const res = await syncService.syncWorkspace();
+      activeSyncService = syncService;
+      const res = await syncService.syncWorkspace({
+        noRender: parsed.booleans.has("--no-render"),
+      });
       console.log(formatSyncToon(res));
-
-      if (!parsed.booleans.has("--no-render")) {
-        const cache = await app.store.readCache();
-        const guide = ontology.guide.enabled
-          ? await app.store.readGuideSummary(ontology.guide.summary_file)
-          : null;
-        for (const [pName, pScope] of Object.entries(ontology.agent_scopes)) {
-          if (pScope.injection_mode === "render" && pScope.render_target) {
-            const rendered = app.ontologyEngine.renderLevel0(
-              ontology,
-              cache,
-              guide,
-              pName,
-            );
-            const existing = await app.store.readExternalFile(pScope.render_target);
-            const updated = app.ontologyEngine.upsertRenderBlock(
-              existing,
-              ontology.workspace.name,
-              pName,
-              rendered.text,
-            );
-            await app.store.writeExternalFile(pScope.render_target, updated);
-          }
-        }
-      }
-
       await app.metrics.append({
         ts: new Date().toISOString(),
         profile: profileName,
@@ -288,15 +286,15 @@ async function run(): Promise<void> {
       if (!target) {
         throw new AxiError(
           "INVALID_ARGUMENT",
-          "Usage: wiki query <alias> [--where Prop=Val] [--fields a,b] [--limit 20]",
+          "Usage: wiki query <alias> [--where Prop=Val] [--fields a,b] [--follow <rel>] [--limit 20]",
         );
       }
       const { token } = await app.secrets.resolveToken({
         profile: profileName,
         tokenRef: scope.token_ref,
-        envVar: scope.notion_token_env,
       });
       const syncService = app.createSyncService(token);
+      activeSyncService = syncService;
       const fieldsRaw = firstFlag(parsed, "--fields");
       const limitRaw = firstFlag(parsed, "--limit");
       const res = await syncService.queryDatabase(profileName, target, {
@@ -306,6 +304,7 @@ async function run(): Promise<void> {
           : undefined,
         limit: limitRaw ? Number(limitRaw) : undefined,
         cursor: firstFlag(parsed, "--cursor"),
+        follow: firstFlag(parsed, "--follow"),
       });
       console.log(formatQueryToon(res));
       await app.metrics.append({
@@ -326,14 +325,18 @@ async function run(): Promise<void> {
     if (parsed.command === "read") {
       const target = parsed.positionals[0];
       if (!target) {
-        throw new AxiError("INVALID_ARGUMENT", "Usage: wiki read <page-id-or-url> [--full] [--offset N]");
+        throw new AxiError(
+          "INVALID_ARGUMENT",
+          "Usage: wiki read <page-id-url-or-alias> [--full] [--offset N]",
+        );
       }
+      activeResolvedVia = classifyResolution(target);
       const { token } = await app.secrets.resolveToken({
         profile: profileName,
         tokenRef: scope.token_ref,
-        envVar: scope.notion_token_env,
       });
       const syncService = app.createSyncService(token);
+      activeSyncService = syncService;
       const offsetRaw = firstFlag(parsed, "--offset");
       const res = await syncService.readPage(profileName, target, {
         full: parsed.booleans.has("--full"),
@@ -345,7 +348,7 @@ async function run(): Promise<void> {
         profile: profileName,
         command: "read",
         target_alias: null,
-        resolved_via: target.includes("notion.so") ? "raw_url" : "alias",
+        resolved_via: res.resolvedVia,
         outcome: "ok",
         error_code: null,
         http_status: 200,
@@ -365,21 +368,14 @@ async function run(): Promise<void> {
     await app.metrics
       .append({
         ts: new Date().toISOString(),
-        profile: profileName,
+        profile: activeProfile,
         command: parsed.command,
         target_alias: parsed.positionals[0] ?? null,
-        resolved_via: "none",
-        outcome:
-          axi?.code === "SCOPE_DENIED" || axi?.code === "SCOPE_LOCKED" || axi?.code === "OUT_OF_ROOT_SCOPE"
-            ? "scope_denied"
-            : axi?.code === "RATE_LIMITED"
-              ? "http_429"
-              : axi?.code === "VALIDATION_ERROR"
-                ? "validation_error"
-                : "error",
+        resolved_via: activeResolvedVia,
+        outcome: mapErrorOutcome(axi),
         error_code: axi?.code ?? "UNEXPECTED",
         http_status: axi?.httpStatus ?? null,
-        notion_calls: 0,
+        notion_calls: activeSyncService?.getApiCallCount() ?? 0,
         duration_ms: Date.now() - startedAt,
       })
       .catch(() => undefined);

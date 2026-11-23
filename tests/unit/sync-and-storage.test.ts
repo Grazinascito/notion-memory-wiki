@@ -3,10 +3,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
+import { formatQueryToon } from "../../src/cli/toon.js";
 import { OntologyEngine } from "../../src/core/ontology/ontology-engine.js";
+import { RenderService } from "../../src/core/ontology/render-service.js";
 import type { NotionGateway } from "../../src/core/ports.js";
 import { REDACTED_MARKER, ScopeGuard } from "../../src/core/scope/scope-guard.js";
 import { SyncService } from "../../src/core/sync/sync-service.js";
+import { TokenProvider } from "../../src/infra/auth/token-provider.js";
+import { withAdvisoryLock } from "../../src/infra/fs/posix-fs.js";
 import { NotionHttpClient } from "../../src/infra/notion/notion-http-client.js";
 import { CrossProcessRateLimiter } from "../../src/infra/ratelimit/cross-process-rate-limiter.js";
 import { JsonMetadataStore } from "../../src/infra/storage/json-metadata-store.js";
@@ -167,6 +171,14 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
         queryDataSource: async (dsId, body) => {
           calls += 1;
           if (dsId === "root-ds-1") {
+            if (body?.result_type === "data_source") {
+              return {
+                object: "list",
+                has_more: false,
+                next_cursor: null,
+                results: [],
+              };
+            }
             assert.equal(body?.result_type, "page");
             return {
               object: "list",
@@ -275,12 +287,439 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
       assert.equal(query.rows.length, 1);
       assert.equal(query.rows[0]!.fields.Name, "Project Alpha");
       assert.equal(query.rows[0]!.fields.Status, "In progress");
+      assert.match(query.nonce, /^[0-9a-f]{16}$/);
+      const queryToon = formatQueryToon(query);
+      assert.match(queryToon, new RegExp(`<<<UNTRUSTED_NOTION_CONTENT nonce=${query.nonce}`));
+      assert.match(queryToon, new RegExp(`<<<END_UNTRUSTED_NOTION_CONTENT nonce=${query.nonce}>>>`));
 
       const page = await sync.readPage("default", "11111111-1111-1111-1111-111111111111");
       assert.match(page.content, /<<<UNTRUSTED_NOTION_CONTENT nonce=[0-9a-f]{16}/);
       assert.equal(page.content.includes("javascript:"), false);
       assert.match(page.content, /\[blocked-uri\]/);
       assert.notEqual(REDACTED_MARKER, "");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("deletes removed keys and preserves array item comments during patchOntology", async () => {
+    const dir = await makeTempDir();
+    try {
+      const store = new JsonMetadataStore(dir);
+      const rawYaml = [
+        "version: 1",
+        "workspace:",
+        "  name: my-wiki",
+        '  root_id: "00000000-0000-0000-0000-000000000000"',
+        "  root_type: wiki_database",
+        "  approved_linked_view_ids: []",
+        "taxonomy: []",
+        "databases:",
+        "  keep_db:",
+        '    data_source_id: "ds-keep"',
+        '    area: ""',
+        '    purpose: "Keep"',
+        "    alt_labels: []",
+        "    pinned_level0: false",
+        "    extra_required_fields: []",
+        "    numeric_bounds: {}",
+        "    stale_after_days: 30",
+        "    allow_wiki_verification: false",
+        "  drop_db:",
+        '    data_source_id: "ds-drop"',
+        '    area: ""',
+        '    purpose: "Drop"',
+        "    alt_labels: []",
+        "    pinned_level0: false",
+        "    extra_required_fields: []",
+        "    numeric_bounds: {}",
+        "    stale_after_days: 30",
+        "    allow_wiki_verification: false",
+        "excluded_data_source_ids:",
+        '  - "ds-legacy" # keep array item comment',
+        "guide:",
+        "  enabled: false",
+        '  summary_file: "guide-summary.md"',
+        "  user_pinned: false",
+        "  pages: []",
+        "agent_scopes:",
+        "  default:",
+        "    injection_mode: wakeup_on_demand",
+        '    allow_areas: ["*"]',
+        '    allow_databases: ["*"]',
+        "    deny_databases: []",
+        '    allow_guide_pages: "all"',
+        "    read_only: false",
+        "maintenance:",
+        "  enabled: false",
+        "  mode: deterministic",
+        "  max_pages: 200",
+        "  report_page_id: null",
+        "",
+      ].join("\n");
+      await fs.writeFile(path.join(dir, "ontology.yaml"), rawYaml, "utf8");
+
+      await store.patchOntology((curr) => {
+        const nextDbs = { ...curr.databases };
+        delete nextDbs.drop_db;
+        return { ...curr, databases: nextDbs };
+      });
+
+      const after = await fs.readFile(path.join(dir, "ontology.yaml"), "utf8");
+      assert.equal(after.includes("drop_db"), false);
+      assert.equal(after.includes("keep_db"), true);
+      assert.match(after, /# keep array item comment/);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reclaims a 0-byte stale lockfile in withAdvisoryLock", async () => {
+    const dir = await makeTempDir();
+    try {
+      const locksDir = path.join(dir, "locks");
+      await fs.mkdir(locksDir, { recursive: true });
+      const lockPath = path.join(locksDir, "zero-byte.lock");
+      await fs.writeFile(lockPath, "", "utf8");
+      const tenSecondsAgo = new Date(Date.now() - 10_000);
+      await fs.utimes(lockPath, tenSecondsAgo, tenSecondsAgo);
+
+      let ran = false;
+      await withAdvisoryLock(dir, "zero-byte", async () => {
+        ran = true;
+      });
+      assert.equal(ran, true);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects profile path traversal and prevents non-default profiles from falling back to default.token", async () => {
+    const dir = await makeTempDir();
+    const prevEnv = process.env.NOTION_TOKEN;
+    delete process.env.NOTION_TOKEN;
+    try {
+      const tp = new TokenProvider(dir);
+      await assert.rejects(
+        () => tp.storeTokenFile("../evil", "secret_abc"),
+        (err: unknown) => err instanceof AxiError && err.code === "INVALID_ARGUMENT",
+      );
+      await assert.rejects(
+        () => tp.resolveToken({ profile: "a/b" }),
+        (err: unknown) => err instanceof AxiError && err.code === "INVALID_ARGUMENT",
+      );
+
+      await tp.storeTokenFile("default", "secret_default_rw");
+      await assert.rejects(
+        () => tp.resolveToken({ profile: "read_only" }),
+        (err: unknown) => err instanceof AxiError && err.code === "TOKEN_MISSING",
+      );
+    } finally {
+      if (prevEnv !== undefined) process.env.NOTION_TOKEN = prevEnv;
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces PAT guard on setupWorkspace unless allowPat is true", async () => {
+    const dir = await makeTempDir();
+    try {
+      const store = new JsonMetadataStore(dir);
+      const guard = new ScopeGuard();
+      const engine = new OntologyEngine(guard);
+      const fakeNotion = {
+        getCallCount: () => 1,
+        getMe: async () => ({ id: "user-1", name: "Human", type: "person" }),
+      } as unknown as NotionGateway;
+
+      const sync = new SyncService(fakeNotion, store, guard, engine);
+      await assert.rejects(
+        () =>
+          sync.setupWorkspace({
+            rootUrlOrId: "00000000-0000-0000-0000-000000000000",
+          }),
+        (err: unknown) => err instanceof AxiError && err.code === "SCOPE_DENIED",
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("shares global token bucket across mixed endpoints and caps max in-flight requests", async () => {
+    const dir = await makeTempDir();
+    try {
+      const rl = new CrossProcessRateLimiter({
+        wikiHome: dir,
+        interactiveRatePerSec: 100,
+        burst: 3,
+        maxInFlightInteractive: 3,
+      });
+
+      // Mixed endpoints consume from the shared global bucket.
+      await rl.acquire("pages-get", "interactive");
+      rl.release("interactive");
+      await rl.acquire("blocks-children", "interactive");
+      rl.release("interactive");
+      await rl.acquire("views-list", "interactive");
+      rl.release("interactive");
+
+      const state = await rl.readState();
+      assert.ok(state.global);
+      assert.ok(state.global.tokens < 1.5);
+
+      // Concurrent NotionHttpClient calls respect maxInFlightInteractive = 3.
+      let active = 0;
+      let maxActive = 0;
+      const concurrentRl = new CrossProcessRateLimiter({
+        wikiHome: dir,
+        interactiveRatePerSec: 1000,
+        burst: 10,
+        maxInFlightInteractive: 3,
+      });
+      const mockFetch = (async () => {
+        active += 1;
+        if (active > maxActive) maxActive = active;
+        await new Promise((r) => setTimeout(r, 40));
+        active -= 1;
+        return new Response(JSON.stringify({ id: "u1", type: "bot" }), { status: 200 });
+      }) as typeof fetch;
+
+      const client = new NotionHttpClient({
+        token: "secret_test",
+        rateLimiter: concurrentRl,
+        fetchFn: mockFetch,
+      });
+
+      await Promise.all([
+        client.getMe(),
+        client.getMe(),
+        client.getMe(),
+        client.getMe(),
+        client.getMe(),
+      ]);
+      assert.ok(maxActive <= 3);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("renders Push block via RenderService and rejects duplicate injection modes", async () => {
+    const dir = await makeTempDir();
+    try {
+      const store = new JsonMetadataStore(dir);
+      const guard = new ScopeGuard();
+      const engine = new OntologyEngine(guard);
+      const renderService = new RenderService(store, engine);
+      const targetFile = path.join(dir, "AGENTS.md");
+
+      await store.writeOntology({
+        version: 1,
+        workspace: {
+          name: "test-wiki",
+          root_id: "00000000-0000-0000-0000-000000000000",
+          root_type: "wiki_database",
+          approved_linked_view_ids: [],
+        },
+        taxonomy: [],
+        databases: {},
+        excluded_data_source_ids: [],
+        guide: { enabled: false, summary_file: "guide-summary.md", user_pinned: false, pages: [] },
+        agent_scopes: {
+          render_agent: {
+            injection_mode: "render",
+            render_target: targetFile,
+            allow_areas: ["*"],
+            allow_databases: ["*"],
+            deny_databases: [],
+            allow_guide_pages: "all",
+            read_only: false,
+          },
+          hook_agent: {
+            injection_mode: "hook",
+            allow_areas: ["*"],
+            allow_databases: ["*"],
+            deny_databases: [],
+            allow_guide_pages: "all",
+            read_only: false,
+          },
+        },
+        maintenance: { enabled: false, mode: "deterministic", max_pages: 200, report_page_id: null },
+      });
+
+      const res = await renderService.renderProfile("render_agent");
+      assert.equal(res.renderTarget, targetFile);
+      const content = await fs.readFile(targetFile, "utf8");
+      assert.match(content, /notion-memory-wiki:start workspace=test-wiki profile=render_agent/);
+
+      await assert.rejects(
+        () => renderService.renderProfile("hook_agent"),
+        (err: unknown) => err instanceof AxiError && err.code === "DUPLICATE_INJECTION_MODE",
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("paginates listViews, resolves view.parent.database_id fallback, auto-renders on setup, and blocks out-of-scope --follow", async () => {
+    const dir = await makeTempDir();
+    try {
+      const store = new JsonMetadataStore(dir);
+      const guard = new ScopeGuard();
+      const engine = new OntologyEngine(guard);
+      const renderTarget = path.join(dir, "AGENTS.md");
+
+      let calls = 0;
+      const fakeNotion: NotionGateway = {
+        getCallCount: () => calls,
+        getMe: async () => {
+          calls += 1;
+          return { id: "bot-1", type: "bot" };
+        },
+        getDatabase: async (id) => {
+          calls += 1;
+          if (id === "view-container-db-2") {
+            return {
+              object: "database",
+              id,
+              title: [{ plain_text: "Inline View Container" }],
+              parent: { type: "page_id", page_id: "hub-work-1" },
+              last_edited_time: "2026-11-23T00:00:00.000Z",
+            };
+          }
+          return {
+            object: "database",
+            id,
+            title: [{ plain_text: "Root" }],
+            parent: { type: "workspace", workspace: true },
+            wiki: true,
+            last_edited_time: "2026-11-23T00:00:00.000Z",
+            data_sources: [{ id: "root-ds-1", name: "Root" }],
+          };
+        },
+        getPage: async (id) => {
+          calls += 1;
+          return {
+            object: "page",
+            id,
+            parent: { type: "page_id", page_id: "00000000-0000-0000-0000-000000000000" },
+            last_edited_time: "2026-11-23T00:00:00.000Z",
+            properties: {},
+          };
+        },
+        getDataSource: async (id) => {
+          calls += 1;
+          return {
+            object: "data_source",
+            id,
+            title: [{ plain_text: "Projects" }],
+            parent: { type: "database_id", database_id: "db-projects" },
+            last_edited_time: "2026-11-23T00:00:00.000Z",
+            properties: {
+              Name: { id: "title", name: "Name", type: "title" },
+              HealthLink: {
+                id: "rel_1",
+                name: "HealthLink",
+                type: "relation",
+                relation: { data_source_id: "ds-health" },
+              },
+            },
+          };
+        },
+        listBlockChildren: async () => {
+          calls += 1;
+          return { object: "list", has_more: false, next_cursor: null, results: [] };
+        },
+        queryDataSource: async (_dsId, body) => {
+          calls += 1;
+          if (body?.result_type === "page") {
+            return {
+              object: "list",
+              has_more: false,
+              next_cursor: null,
+              results: [
+                {
+                  object: "page",
+                  id: "hub-work-1",
+                  parent: { type: "data_source_id", data_source_id: "root-ds-1" },
+                  last_edited_time: "2026-11-23T00:00:00.000Z",
+                  properties: { Title: { type: "title", title: [{ plain_text: "Work" }] } },
+                },
+              ],
+            };
+          }
+          return { object: "list", has_more: false, next_cursor: null, results: [] };
+        },
+        search: async () => {
+          calls += 1;
+          return {
+            object: "list",
+            has_more: false,
+            next_cursor: null,
+            results: [
+              {
+                object: "data_source",
+                id: "ds-projects",
+                title: [{ plain_text: "Projects" }],
+                parent: { type: "database_id", database_id: "db-projects" },
+                last_edited_time: "2026-11-23T00:00:00.000Z",
+                properties: {
+                  Name: { id: "title", name: "Name", type: "title" },
+                  HealthLink: {
+                    id: "rel_1",
+                    name: "HealthLink",
+                    type: "relation",
+                    relation: { data_source_id: "ds-health" },
+                  },
+                },
+              },
+            ],
+          };
+        },
+        listViews: async (params) => {
+          calls += 1;
+          if (!params.start_cursor) {
+            return {
+              object: "list",
+              has_more: true,
+              next_cursor: "cursor-2",
+              results: [],
+            };
+          }
+          return {
+            object: "list",
+            has_more: false,
+            next_cursor: null,
+            results: [
+              {
+                object: "view",
+                id: "view-page-2",
+                name: "Linked",
+                type: "table",
+                parent: { type: "database_id", database_id: "view-container-db-2" },
+                data_source_id: "ds-projects",
+              },
+            ],
+          };
+        },
+        getPageMarkdown: async () => {
+          calls += 1;
+          return { markdown: "", truncated: false, unknown_block_ids: [] };
+        },
+      };
+
+      const sync = new SyncService(fakeNotion, store, guard, engine);
+      const setup = await sync.setupWorkspace({
+        rootUrlOrId: "00000000-0000-0000-0000-000000000000",
+        renderTarget,
+      });
+      assert.equal(setup.unplacedDataSourceIds.length, 0);
+      assert.deepEqual(setup.ontology.workspace.approved_linked_view_ids, ["view-page-2"]);
+      const renderedFile = await fs.readFile(renderTarget, "utf8");
+      assert.match(renderedFile, /notion-memory-wiki:start/);
+
+      await assert.rejects(
+        () => sync.queryDatabase("default", "projects", { follow: "HealthLink" }),
+        (err: unknown) => err instanceof AxiError && err.code === "SCOPE_DENIED",
+      );
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }

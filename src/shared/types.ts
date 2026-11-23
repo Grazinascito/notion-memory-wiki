@@ -54,7 +54,6 @@ export interface AgentScopeConfig {
   injection_mode: InjectionMode;
   render_target?: string;
   token_ref?: string;
-  notion_token_env?: string;
   allow_areas: string[];
   allow_databases: string[];
   deny_databases: string[];
@@ -156,6 +155,11 @@ export interface FractalPointers {
   by_parent_page_id: Record<string, FractalPointer[]>;
 }
 
+export interface RateLimitBucketState {
+  tokens: number;
+  last_refill_ms: number;
+}
+
 export interface RateLimitEndpointState {
   tokens: number;
   last_refill_ms: number;
@@ -167,6 +171,7 @@ export interface RateLimitState {
   retry_after_until: number;
   last_reason: string | null;
   last_active_chat_at: number;
+  global?: RateLimitBucketState;
   endpoints: Record<string, RateLimitEndpointState>;
 }
 
@@ -214,17 +219,64 @@ export interface NotionDatabase {
   data_sources?: Array<{ id: string; name?: string }>;
 }
 
-export interface NotionPropertySchema {
+export interface NotionSelectOptionSchema {
+  id?: string;
+  name: string;
+  color?: string;
+}
+
+export interface NotionPropertySchemaBase {
   id: string;
   name?: string;
-  type: string;
-  select?: { options: Array<{ id?: string; name: string; color?: string }> };
-  multi_select?: { options: Array<{ id?: string; name: string; color?: string }> };
-  status?: { options: Array<{ id?: string; name: string; color?: string }> };
-  relation?: { data_source_id?: string; database_id?: string };
-  rollup?: { relation_property_name?: string; relation_property_id?: string };
-  formula?: { expression?: string };
 }
+
+export type NotionPropertySchema =
+  | (NotionPropertySchemaBase & { type: "title"; title?: Record<string, unknown> })
+  | (NotionPropertySchemaBase & { type: "rich_text"; rich_text?: Record<string, unknown> })
+  | (NotionPropertySchemaBase & { type: "number"; number?: { format?: string } })
+  | (NotionPropertySchemaBase & { type: "checkbox"; checkbox?: Record<string, unknown> })
+  | (NotionPropertySchemaBase & { type: "url"; url?: Record<string, unknown> })
+  | (NotionPropertySchemaBase & { type: "email"; email?: Record<string, unknown> })
+  | (NotionPropertySchemaBase & { type: "phone_number"; phone_number?: Record<string, unknown> })
+  | (NotionPropertySchemaBase & { type: "date"; date?: Record<string, unknown> })
+  | (NotionPropertySchemaBase & { type: "created_time"; created_time?: Record<string, unknown> })
+  | (NotionPropertySchemaBase & { type: "last_edited_time"; last_edited_time?: Record<string, unknown> })
+  | (NotionPropertySchemaBase & { type: "created_by"; created_by?: Record<string, unknown> })
+  | (NotionPropertySchemaBase & { type: "last_edited_by"; last_edited_by?: Record<string, unknown> })
+  | (NotionPropertySchemaBase & { type: "unique_id"; unique_id?: { prefix?: string | null } })
+  | (NotionPropertySchemaBase & {
+      type: "select";
+      select: { options: NotionSelectOptionSchema[] };
+    })
+  | (NotionPropertySchemaBase & {
+      type: "multi_select";
+      multi_select: { options: NotionSelectOptionSchema[] };
+    })
+  | (NotionPropertySchemaBase & {
+      type: "status";
+      status: { options: NotionSelectOptionSchema[] };
+    })
+  | (NotionPropertySchemaBase & {
+      type: "relation";
+      relation: { data_source_id?: string; database_id?: string };
+    })
+  | (NotionPropertySchemaBase & {
+      type: "rollup";
+      rollup: {
+        relation_property_name?: string;
+        relation_property_id?: string;
+        function?: string;
+      };
+    })
+  | (NotionPropertySchemaBase & {
+      type: "formula";
+      formula: { expression?: string };
+    })
+  | (NotionPropertySchemaBase & {
+      type: "verification";
+      verification?: Record<string, unknown>;
+    })
+  | (NotionPropertySchemaBase & { type: "unsupported" });
 
 export interface NotionDataSource {
   object: "data_source";
@@ -236,6 +288,49 @@ export interface NotionDataSource {
   properties: Record<string, NotionPropertySchema>;
 }
 
+export type NotionFormulaValue =
+  | { type: "string"; string: string | null }
+  | { type: "number"; number: number | null }
+  | { type: "boolean"; boolean: boolean | null }
+  | { type: "date"; date: { start: string; end?: string | null } | null };
+
+export type NotionRollupValue =
+  | { type: "number"; number: number | null }
+  | { type: "date"; date: { start: string; end?: string | null } | null }
+  | { type: "array"; array: NotionPropertyValue[] }
+  | { type: "unsupported"; unsupported?: Record<string, unknown> }
+  | { type: "incomplete"; incomplete?: Record<string, unknown> };
+
+export interface NotionVerificationValue {
+  state: "verified" | "unverified" | "expired";
+  verified_by?: { id: string; name?: string } | null;
+  date?: { start: string; end?: string | null } | null;
+}
+
+export type NotionPropertyValue =
+  | { id?: string; type: "title"; title: NotionRichText[] }
+  | { id?: string; type: "rich_text"; rich_text: NotionRichText[] }
+  | { id?: string; type: "status"; status: { id?: string; name: string; color?: string } | null }
+  | { id?: string; type: "select"; select: { id?: string; name: string; color?: string } | null }
+  | {
+      id?: string;
+      type: "multi_select";
+      multi_select: Array<{ id?: string; name: string; color?: string }>;
+    }
+  | { id?: string; type: "number"; number: number | null }
+  | { id?: string; type: "checkbox"; checkbox: boolean }
+  | { id?: string; type: "url"; url: string | null }
+  | { id?: string; type: "email"; email: string | null }
+  | { id?: string; type: "phone_number"; phone_number: string | null }
+  | { id?: string; type: "date"; date: { start: string; end?: string | null } | null }
+  | { id?: string; type: "relation"; relation: Array<{ id: string }>; has_more?: boolean }
+  | { id?: string; type: "formula"; formula: NotionFormulaValue }
+  | { id?: string; type: "rollup"; rollup: NotionRollupValue }
+  | { id?: string; type: "created_time"; created_time: string }
+  | { id?: string; type: "last_edited_time"; last_edited_time: string }
+  | { id?: string; type: "verification"; verification: NotionVerificationValue | null }
+  | { id?: string; type: "unsupported" };
+
 export interface NotionPage {
   object: "page";
   id: string;
@@ -243,7 +338,7 @@ export interface NotionPage {
   parent: NotionParent;
   last_edited_time: string;
   in_trash?: boolean;
-  properties: Record<string, Record<string, unknown>>;
+  properties: Record<string, NotionPropertyValue>;
 }
 
 export interface NotionBlock {

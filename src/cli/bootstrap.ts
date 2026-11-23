@@ -8,6 +8,7 @@ import type {
   SecretStore,
 } from "../core/ports.js";
 import { OntologyEngine } from "../core/ontology/ontology-engine.js";
+import { RenderService } from "../core/ontology/render-service.js";
 import { ScopeGuard } from "../core/scope/scope-guard.js";
 import { SyncService } from "../core/sync/sync-service.js";
 import { TokenProvider } from "../infra/auth/token-provider.js";
@@ -24,6 +25,7 @@ export interface AppContainer {
   metrics: MetricsLogger;
   scopeGuard: ScopeGuard;
   ontologyEngine: OntologyEngine;
+  renderService: RenderService;
   createNotionGateway(token: string): NotionGateway;
   createSyncService(token: string): SyncService;
 }
@@ -41,6 +43,7 @@ export function bootstrapApp(wikiHome = resolveWikiHome()): AppContainer {
   const metrics = new JsonlMetricsLogger(wikiHome);
   const scopeGuard = new ScopeGuard();
   const ontologyEngine = new OntologyEngine(scopeGuard);
+  const renderService = new RenderService(store, ontologyEngine);
 
   const createNotionGateway = (token: string): NotionGateway =>
     new NotionHttpClient({
@@ -55,6 +58,7 @@ export function bootstrapApp(wikiHome = resolveWikiHome()): AppContainer {
       store,
       scopeGuard,
       ontologyEngine,
+      renderService,
     );
 
   return {
@@ -65,6 +69,7 @@ export function bootstrapApp(wikiHome = resolveWikiHome()): AppContainer {
     metrics,
     scopeGuard,
     ontologyEngine,
+    renderService,
     createNotionGateway,
     createSyncService,
   };

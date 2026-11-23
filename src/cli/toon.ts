@@ -21,15 +21,7 @@ export function formatCatalogToon(entries: CatalogEntry[]): string {
 export function formatQueryToon(res: QueryDatabaseResult): string {
   const header = `query[${res.rows.length}] alias=${res.alias} via=${res.resolvedVia} calls=${res.apiCalls}${res.hasMore ? ` next_cursor=${res.nextCursor}` : ""}`;
   if (res.rows.length === 0) return `${header}\n  (no matching rows)`;
-
-  const lines = [header];
-  for (const row of res.rows) {
-    const pairs = Object.entries(row.fields)
-      .map(([k, v]) => `${k}=${v.replace(/\s+/g, " ").trim()}`)
-      .join(" | ");
-    lines.push(`  ${row.id} | ${pairs}`);
-  }
-  return lines.join("\n");
+  return `${header}\n${res.wrappedRows}`;
 }
 
 export function formatReadToon(res: ReadPageResult): string {

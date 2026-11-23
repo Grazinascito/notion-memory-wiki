@@ -93,9 +93,13 @@ export class NotionHttpClient implements NotionGateway {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-      let response: Response;
+      let status = 0;
+      let statusText = "";
+      let ok = false;
+      let retryAfterHeader: string | null = null;
+      let bodyText = "";
       try {
-        response = await this.fetchFn(url, {
+        const response = await this.fetchFn(url, {
           method: params.method,
           headers: {
             Authorization: `Bearer ${this.token}`,
@@ -106,8 +110,12 @@ export class NotionHttpClient implements NotionGateway {
           redirect: "error",
           signal: controller.signal,
         });
+        status = response.status;
+        statusText = response.statusText;
+        ok = response.ok;
+        retryAfterHeader = response.headers.get("retry-after");
+        bodyText = await response.text();
       } catch (err) {
-        clearTimeout(timer);
         if (params.isWrite) {
           throw new AxiError(
             "AMBIGUOUS_WRITE_OUTCOME",
@@ -125,24 +133,22 @@ export class NotionHttpClient implements NotionGateway {
         );
       } finally {
         clearTimeout(timer);
+        this.rateLimiter.release(this.trafficClass);
       }
 
-      if (response.ok) {
-        return (await response.json()) as T;
+      if (ok) {
+        return JSON.parse(bodyText) as T;
       }
 
       let errorBody: NotionErrorPayload = {};
       try {
-        errorBody = (await response.json()) as NotionErrorPayload;
+        errorBody = JSON.parse(bodyText) as NotionErrorPayload;
       } catch {
         // Non-JSON error body.
       }
 
-      if (response.status === 429) {
-        const waitMs = this.parseRetryAfterMs(
-          response.headers.get("retry-after"),
-          attempt,
-        );
+      if (status === 429) {
+        const waitMs = this.parseRetryAfterMs(retryAfterHeader, attempt);
         const reason = errorBody.additional_data?.rate_limit_reason ?? null;
         await this.rateLimiter.recordRateLimit(params.endpointKey, waitMs, reason);
         if (attempt < MAX_RETRIES) {
@@ -156,13 +162,13 @@ export class NotionHttpClient implements NotionGateway {
         );
       }
 
-      if (response.status >= 500) {
+      if (status >= 500) {
         if (params.isWrite) {
           throw new AxiError(
             "AMBIGUOUS_WRITE_OUTCOME",
-            `Notion returned HTTP ${response.status} on write ${params.method} ${params.path}; aborted without blind retry to prevent duplicates.`,
+            `Notion returned HTTP ${status} on write ${params.method} ${params.path}; aborted without blind retry to prevent duplicates.`,
             ["Verify whether the write succeeded in Notion before retrying."],
-            response.status,
+            status,
           );
         }
         if (attempt < MAX_RETRIES) {
@@ -171,14 +177,14 @@ export class NotionHttpClient implements NotionGateway {
         }
       }
 
-      const code = response.status === 404 ? "NOT_FOUND" : "NOTION_API_ERROR";
+      const code = status === 404 ? "NOT_FOUND" : "NOTION_API_ERROR";
       throw new AxiError(
         code,
-        `Notion API HTTP ${response.status} (${errorBody.code ?? "error"}): ${errorBody.message ?? response.statusText}`,
-        response.status === 404
+        `Notion API HTTP ${status} (${errorBody.code ?? "error"}): ${errorBody.message ?? statusText}`,
+        status === 404
           ? ["Verify that the target page or database is shared with your Notion integration."]
           : [],
-        response.status,
+        status,
       );
     }
 

@@ -5,7 +5,7 @@ import type { MetricEvent } from "../../shared/types.js";
 import {
   ensureSecureDir,
   expandUserPath,
-} from "../storage/json-metadata-store.js";
+} from "../fs/posix-fs.js";
 
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 

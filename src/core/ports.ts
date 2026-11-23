@@ -73,6 +73,7 @@ export interface MetadataStore {
 
 export interface RateLimiter {
   acquire(endpointKey: string, trafficClass: "interactive" | "maintenance"): Promise<void>;
+  release(trafficClass: "interactive" | "maintenance"): void;
   recordRateLimit(
     endpointKey: string,
     waitMs: number,
@@ -85,7 +86,6 @@ export interface SecretStore {
   resolveToken(options: {
     profile: string;
     tokenRef?: string;
-    envVar?: string;
   }): Promise<{ token: string; source: "keychain" | "token_file" | "env" }>;
   storeTokenFile(profile: string, token: string): Promise<string>;
 }

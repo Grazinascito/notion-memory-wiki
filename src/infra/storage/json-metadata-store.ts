@@ -1,9 +1,16 @@
 import fs from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import crypto from "node:crypto";
-import { parseDocument, stringify } from "yaml";
+import {
+  type Document,
+  isMap,
+  isNode,
+  isScalar,
+  isSeq,
+  parseDocument,
+  stringify,
+  type YAMLMap,
+  type YAMLSeq,
+} from "yaml";
 import type { MetadataStore } from "../../core/ports.js";
 import { AxiError } from "../../shared/errors.js";
 import type {
@@ -11,141 +18,109 @@ import type {
   FractalPointers,
   OntologyConfig,
 } from "../../shared/types.js";
+import {
+  atomicWriteFile,
+  ensureSecureDir,
+  expandUserPath,
+  withAdvisoryLock,
+} from "../fs/posix-fs.js";
 
-const LOCK_STALE_MS = 5_000;
-const LOCK_RETRY_MS = 25;
-const LOCK_TIMEOUT_MS = 3_000;
-
-export function expandUserPath(rawPath: string): string {
-  if (rawPath.startsWith("~/")) {
-    return path.join(os.homedir(), rawPath.slice(2));
-  }
-  if (path.isAbsolute(rawPath)) {
-    return rawPath;
-  }
-  throw new AxiError(
-    "CONFIG_INVALID",
-    `Path "${rawPath}" must be absolute or start with "~/" (relative paths are forbidden).`,
-    ['Example: "~/workspace/AGENTS.md" or "/Users/you/workspace/AGENTS.md"'],
-  );
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-export async function ensureSecureDir(dirPath: string): Promise<void> {
-  await fs.mkdir(dirPath, { recursive: true, mode: 0o700 });
-  try {
-    await fs.chmod(dirPath, 0o700);
-  } catch {
-    // Ignore chmod failures on non-owned parent mounts.
+function syncYamlSeq(doc: Document, seqNode: YAMLSeq, updated: unknown[]): void {
+  // Preserve unchanged sequence nodes and their inline item comments verbatim.
+  if (
+    seqNode.items.length === updated.length &&
+    JSON.stringify(seqNode.toJSON()) === JSON.stringify(updated)
+  ) {
+    return;
   }
-}
 
-export async function atomicWriteFile(
-  targetPath: string,
-  content: string,
-  mode = 0o600,
-): Promise<void> {
-  const dir = path.dirname(targetPath);
-  await fs.mkdir(dir, { recursive: true });
-  const tmpName = `.${path.basename(targetPath)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
-  const tmpPath = path.join(dir, tmpName);
-  try {
-    await fs.writeFile(tmpPath, content, { encoding: "utf8", mode });
-    await fs.chmod(tmpPath, mode);
-    await fs.rename(tmpPath, targetPath);
-  } catch (err) {
-    await fs.unlink(tmpPath).catch(() => undefined);
-    throw err;
-  }
-}
-
-export async function withAdvisoryLock<T>(
-  wikiHome: string,
-  lockName: string,
-  fn: () => Promise<T>,
-): Promise<T> {
-  const locksDir = path.join(wikiHome, "locks");
-  await ensureSecureDir(locksDir);
-  const lockPath = path.join(locksDir, `${lockName}.lock`);
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
-
-  let acquired = false;
-  while (!acquired) {
-    try {
-      const handle = await fs.open(
-        lockPath,
-        fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
-        0o600,
-      );
-      try {
-        await handle.writeFile(
-          JSON.stringify({ pid: process.pid, acquired_at: Date.now() }),
-          "utf8",
-        );
-      } finally {
-        await handle.close();
-      }
-      acquired = true;
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") throw err;
-
-      // Reclaim stale lock older than LOCK_STALE_MS.
-      try {
-        const raw = await fs.readFile(lockPath, "utf8");
-        const parsed = JSON.parse(raw) as { acquired_at?: number };
-        if (
-          typeof parsed.acquired_at === "number" &&
-          Date.now() - parsed.acquired_at > LOCK_STALE_MS
-        ) {
-          await fs.unlink(lockPath).catch(() => undefined);
-          continue;
+  for (let i = 0; i < updated.length; i += 1) {
+    const nextItem = updated[i];
+    if (i < seqNode.items.length) {
+      const existingItem = seqNode.items[i];
+      if (isMap(existingItem) && isPlainRecord(nextItem)) {
+        syncYamlMap(doc, existingItem, nextItem);
+      } else if (isSeq(existingItem) && Array.isArray(nextItem)) {
+        syncYamlSeq(doc, existingItem, nextItem);
+      } else if (
+        isScalar(existingItem) &&
+        (nextItem === null || typeof nextItem !== "object")
+      ) {
+        if (existingItem.value !== nextItem) {
+          existingItem.value = nextItem;
         }
-      } catch {
-        // Lock file may have disappeared or been mid-write; retry.
+      } else {
+        const existingJs = isNode(existingItem) ? existingItem.toJSON() : existingItem;
+        if (JSON.stringify(existingJs) !== JSON.stringify(nextItem)) {
+          seqNode.items[i] = doc.createNode(nextItem);
+        }
       }
-
-      if (Date.now() >= deadline) {
-        throw new AxiError(
-          "CONFIG_INVALID",
-          `Timed out waiting for advisory lock "${lockName}".`,
-          [`Remove stale lock at ${lockPath} if no other wiki process is running.`],
-        );
-      }
-      await new Promise((r) => setTimeout(r, LOCK_RETRY_MS));
+    } else {
+      seqNode.add(doc.createNode(nextItem));
     }
   }
 
-  try {
-    return await fn();
-  } finally {
-    await fs.unlink(lockPath).catch(() => undefined);
+  if (seqNode.items.length > updated.length) {
+    seqNode.items.length = updated.length;
+  }
+}
+
+function syncYamlMap(
+  doc: Document,
+  mapNode: YAMLMap,
+  updated: Record<string, unknown>,
+): void {
+  for (const pair of [...mapNode.items]) {
+    const keyName = isScalar(pair.key) ? String(pair.key.value) : String(pair.key);
+    if (
+      !Object.prototype.hasOwnProperty.call(updated, keyName) ||
+      updated[keyName] === undefined
+    ) {
+      mapNode.delete(pair.key);
+    }
+  }
+
+  for (const [key, value] of Object.entries(updated)) {
+    if (value === undefined) continue;
+    const existingNode = mapNode.get(key, true);
+    if (isPlainRecord(value)) {
+      if (isMap(existingNode)) {
+        syncYamlMap(doc, existingNode, value);
+      } else {
+        mapNode.set(key, doc.createNode(value));
+      }
+    } else if (Array.isArray(value)) {
+      if (isSeq(existingNode)) {
+        syncYamlSeq(doc, existingNode, value);
+      } else {
+        mapNode.set(key, doc.createNode(value));
+      }
+    } else if (isScalar(existingNode)) {
+      if (existingNode.value !== value) {
+        existingNode.value = value;
+      }
+    } else {
+      mapNode.set(key, doc.createNode(value));
+    }
   }
 }
 
 /**
  * Recursively synchronize a parsed YAML Document AST with an updated JS object
- * so existing user comments and key ordering stay intact on unchanged nodes.
+ * so existing user comments, array item comments, and key ordering stay intact.
  */
 function applyObjectToYamlDoc(
-  doc: ReturnType<typeof parseDocument>,
+  doc: Document,
   updated: Record<string, unknown>,
-  prefix: string[] = [],
 ): void {
-  for (const [key, value] of Object.entries(updated)) {
-    const keyPath = [...prefix, key];
-    if (
-      value !== null &&
-      typeof value === "object" &&
-      !Array.isArray(value) &&
-      doc.hasIn(keyPath)
-    ) {
-      const existing = doc.getIn(keyPath, true);
-      if (existing && typeof existing === "object" && "items" in existing) {
-        applyObjectToYamlDoc(doc, value as Record<string, unknown>, keyPath);
-        continue;
-      }
-    }
-    doc.setIn(keyPath, value);
+  if (isMap(doc.contents)) {
+    syncYamlMap(doc, doc.contents, updated);
+  } else {
+    doc.contents = doc.createNode(updated);
   }
 }
 

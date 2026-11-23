@@ -204,4 +204,159 @@ describe("ScopeGuard", () => {
     );
     assert.equal(getPageCalls, 4);
   });
+
+  it("excludes ungrouped (area: '') databases when allow_areas is ['*'] and allow_databases is []", () => {
+    const guard = new ScopeGuard();
+    const onto = makeOntology();
+    onto.databases.ungrouped_db = {
+      data_source_id: "ds-ungrouped",
+      area: "",
+      purpose: "Ungrouped DB",
+      alt_labels: [],
+      pinned_level0: false,
+      extra_required_fields: [],
+      numeric_bounds: {},
+      stale_after_days: 30,
+      allow_wiki_verification: false,
+    };
+    onto.agent_scopes.areas_only = {
+      injection_mode: "wakeup_on_demand",
+      allow_areas: ["*"],
+      allow_databases: [],
+      deny_databases: [],
+      allow_guide_pages: "all",
+      read_only: true,
+    };
+    const permitted = guard.getPermittedAliases(onto, "areas_only");
+    assert.equal(permitted.has("ungrouped_db"), false);
+    assert.deepEqual([...permitted].sort(), ["daily_log", "projects", "tasks"]);
+
+    onto.agent_scopes.areas_only.allow_databases = ["*"];
+    const withAllDbs = guard.getPermittedAliases(onto, "areas_only");
+    assert.equal(withAllDbs.has("ungrouped_db"), true);
+  });
+
+  it("fails closed in filterRecordProperties when cache is null or dataSourceId is missing", () => {
+    const guard = new ScopeGuard();
+    const onto = makeOntology();
+    const filtered = guard.filterRecordProperties(
+      onto,
+      null,
+      "work_agent",
+      "ds-projects",
+      {
+        Name: { type: "title", title: [{ plain_text: "Alpha" }] },
+        HealthLink: { type: "relation", relation: [{ id: "secret-health-page" }] },
+        HealthScoreRollup: { type: "rollup", rollup: { type: "number", number: 99 } },
+        SummaryFormula: { type: "formula", formula: { type: "number", number: 100 } },
+      },
+    );
+
+    assert.ok("Name" in filtered);
+    assert.equal("HealthScoreRollup" in filtered, false);
+    assert.equal(filtered.HealthLink, REDACTED_MARKER);
+    assert.equal(filtered.SummaryFormula, REDACTED_MARKER);
+  });
+
+  it("isolates verifyUuidInRootScope session cache per profile and enforces max 4 total GET calls", async () => {
+    const guard = new ScopeGuard();
+    const onto = makeOntology();
+    const workOnlyPageId = "22222222-2222-2222-2222-222222222222";
+    const healthOnlyHubId = onto.taxonomy[1]!.hub_page_id;
+    const unlinkedPageId = "33333333-3333-3333-3333-333333333333";
+
+    let totalGets = 0;
+    const fakeNotion = {
+      getPage: async (id: string) => {
+        totalGets += 1;
+        if (id === workOnlyPageId) {
+          return {
+            object: "page" as const,
+            id,
+            parent: { type: "data_source_id" as const, data_source_id: "ds-projects" },
+            last_edited_time: "2026-11-23T00:00:00.000Z",
+            properties: {},
+          };
+        }
+        return {
+          object: "page" as const,
+          id,
+          parent: { type: "database_id" as const, database_id: `db-hop-${totalGets}` },
+          last_edited_time: "2026-11-23T00:00:00.000Z",
+          properties: {},
+        };
+      },
+      getDatabase: async (id: string) => {
+        totalGets += 1;
+        return {
+          object: "database" as const,
+          id,
+          title: [{ plain_text: "Nested" }],
+          parent: { type: "page_id" as const, page_id: `page-hop-${totalGets}` },
+          last_edited_time: "2026-11-23T00:00:00.000Z",
+          data_sources: [],
+        };
+      },
+    } as unknown as NotionGateway;
+
+    // 1. Blocked hub is denied even though rootId is in workspace.
+    await assert.rejects(
+      () =>
+        guard.verifyUuidInRootScope(
+          onto,
+          null,
+          { schema_version: 1, by_parent_page_id: {} },
+          fakeNotion,
+          "work_agent",
+          healthOnlyHubId,
+        ),
+      (err: unknown) => err instanceof AxiError && err.code === "SCOPE_DENIED",
+    );
+
+    // 2. Cross-profile cache isolation: verify workOnlyPageId under work_agent, then add restricted profile.
+    await guard.verifyUuidInRootScope(
+      onto,
+      null,
+      { schema_version: 1, by_parent_page_id: {} },
+      fakeNotion,
+      "work_agent",
+      workOnlyPageId,
+    );
+    onto.agent_scopes.health_only = {
+      injection_mode: "hook",
+      allow_areas: ["health"],
+      allow_databases: [],
+      deny_databases: [],
+      allow_guide_pages: "all",
+      read_only: true,
+    };
+    await assert.rejects(
+      () =>
+        guard.verifyUuidInRootScope(
+          onto,
+          null,
+          { schema_version: 1, by_parent_page_id: {} },
+          fakeNotion,
+          "health_only",
+          workOnlyPageId,
+        ),
+      (err: unknown) => err instanceof AxiError && err.code === "SCOPE_DENIED",
+    );
+
+    // 3. Alternating getPage + getDatabase chain never exceeds 4 total GET calls.
+    totalGets = 0;
+    await assert.rejects(
+      () =>
+        guard.verifyUuidInRootScope(
+          onto,
+          null,
+          { schema_version: 1, by_parent_page_id: {} },
+          fakeNotion,
+          "work_agent",
+          unlinkedPageId,
+        ),
+      (err: unknown) => err instanceof AxiError && err.code === "OUT_OF_ROOT_SCOPE",
+    );
+    assert.equal(totalGets, 4);
+  });
 });
