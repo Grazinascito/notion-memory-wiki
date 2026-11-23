@@ -1,0 +1,18 @@
+node_modules/
+dist/
+.DS_Store
+
+# Secrets, tokens, and local workspace IDs/state
+.env
+.env.*
+*.token
+tokens/
+docs/wiki-raw-extraction-*.json
+ontology.yaml
+cache.json
+fractal-pointers.json
+rate-limit-state.json
+metrics.jsonl
+metrics.jsonl.*
+proposals/
+locks/
