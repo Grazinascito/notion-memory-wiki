@@ -17,7 +17,10 @@ import type {
   CacheSnapshot,
   FractalPointers,
   OntologyConfig,
+  ProposalRecord,
 } from "../../shared/types.js";
+
+const VALID_PROPOSAL_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 import {
   atomicWriteFile,
   ensureSecureDir,
@@ -310,6 +313,60 @@ export class JsonMetadataStore implements MetadataStore {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  private proposalPath(proposalId: string): string {
+    if (!VALID_PROPOSAL_ID_RE.test(proposalId)) {
+      throw new AxiError(
+        "INVALID_ARGUMENT",
+        `Invalid proposal_id "${proposalId}". Expected 1-64 alphanumeric, "_" or "-" characters.`,
+      );
+    }
+    return path.join(this.wikiHome, "proposals", `${proposalId}.json`);
+  }
+
+  async writeProposal(proposal: ProposalRecord): Promise<void> {
+    const proposalsDir = path.join(this.wikiHome, "proposals");
+    await ensureSecureDir(proposalsDir);
+    const targetPath = this.proposalPath(proposal.proposal_id);
+    await atomicWriteFile(
+      targetPath,
+      `${JSON.stringify(proposal, null, 2)}\n`,
+      0o600,
+    );
+  }
+
+  async readProposal(proposalId: string): Promise<ProposalRecord> {
+    const targetPath = this.proposalPath(proposalId);
+    try {
+      const raw = await fs.readFile(targetPath, "utf8");
+      return JSON.parse(raw) as ProposalRecord;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new AxiError(
+          "NOT_FOUND",
+          `Proposal "${proposalId}" not found in ${path.join(this.wikiHome, "proposals")}.`,
+        );
+      }
+      throw err;
+    }
+  }
+
+  async listProposals(): Promise<ProposalRecord[]> {
+    const proposalsDir = path.join(this.wikiHome, "proposals");
+    try {
+      const entries = await fs.readdir(proposalsDir);
+      const records: ProposalRecord[] = [];
+      for (const entry of entries) {
+        if (!entry.endsWith(".json")) continue;
+        const raw = await fs.readFile(path.join(proposalsDir, entry), "utf8");
+        records.push(JSON.parse(raw) as ProposalRecord);
+      }
+      return records.sort((a, b) => a.created_at.localeCompare(b.created_at));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw err;
     }
   }
 }

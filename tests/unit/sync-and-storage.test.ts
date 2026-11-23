@@ -25,6 +25,35 @@ async function makeTempDir(): Promise<string> {
   return fs.mkdtemp(path.join(os.tmpdir(), "nmw-test-"));
 }
 
+const UNEXPECTED_WRITE_STUBS: Pick<
+  NotionGateway,
+  | "createPage"
+  | "updatePageProperties"
+  | "trashPage"
+  | "movePage"
+  | "patchPageMarkdown"
+  | "updateDataSource"
+> = {
+  createPage: async () => {
+    throw new Error("unexpected createPage in read test");
+  },
+  updatePageProperties: async () => {
+    throw new Error("unexpected updatePageProperties in read test");
+  },
+  trashPage: async () => {
+    throw new Error("unexpected trashPage in read test");
+  },
+  movePage: async () => {
+    throw new Error("unexpected movePage in read test");
+  },
+  patchPageMarkdown: async () => {
+    throw new Error("unexpected patchPageMarkdown in read test");
+  },
+  updateDataSource: async () => {
+    throw new Error("unexpected updateDataSource in read test");
+  },
+};
+
 describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
   it("preserves user YAML comments on patchOntology via CST parseDocument", async () => {
     const dir = await makeTempDir();
@@ -103,6 +132,7 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
 
       let calls = 0;
       const fakeNotion: NotionGateway = {
+        ...UNEXPECTED_WRITE_STUBS,
         getCallCount: () => calls,
         getMe: async () => {
           calls += 1;
@@ -584,6 +614,7 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
 
       let calls = 0;
       const fakeNotion: NotionGateway = {
+        ...UNEXPECTED_WRITE_STUBS,
         getCallCount: () => calls,
         getMe: async () => {
           calls += 1;

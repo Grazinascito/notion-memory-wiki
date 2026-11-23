@@ -292,4 +292,89 @@ export class NotionHttpClient implements NotionGateway {
       isWrite: false,
     });
   }
+
+  async createPage(body: {
+    parent: { type: "data_source_id"; data_source_id: string };
+    properties: Record<string, Record<string, unknown>>;
+  }): Promise<NotionPage> {
+    return this.request({
+      method: "POST",
+      path: "/v1/pages",
+      endpointKey: "pages-create",
+      body,
+      isWrite: true,
+    });
+  }
+
+  async updatePageProperties(
+    pageId: string,
+    properties: Record<string, Record<string, unknown>>,
+  ): Promise<NotionPage> {
+    return this.request({
+      method: "PATCH",
+      path: `/v1/pages/${encodeURIComponent(pageId)}`,
+      endpointKey: "pages-update",
+      body: { properties },
+      isWrite: true,
+    });
+  }
+
+  async trashPage(pageId: string): Promise<NotionPage> {
+    return this.request({
+      method: "PATCH",
+      path: `/v1/pages/${encodeURIComponent(pageId)}`,
+      endpointKey: "pages-trash",
+      body: { in_trash: true },
+      isWrite: true,
+    });
+  }
+
+  async movePage(
+    pageId: string,
+    parent:
+      | { type: "page_id"; page_id: string }
+      | { type: "data_source_id"; data_source_id: string },
+  ): Promise<NotionPage> {
+    return this.request({
+      method: "POST",
+      path: `/v1/pages/${encodeURIComponent(pageId)}/move`,
+      endpointKey: "pages-move",
+      body: { parent },
+      isWrite: true,
+    });
+  }
+
+  async patchPageMarkdown(
+    pageId: string,
+    body:
+      | {
+          type: "insert_content";
+          insert_content: { content: string; position: { type: "end" } };
+        }
+      | {
+          type: "replace_content";
+          replace_content: { new_str: string; allow_deleting_content: boolean };
+        },
+  ): Promise<NotionMarkdownResponse> {
+    return this.request({
+      method: "PATCH",
+      path: `/v1/pages/${encodeURIComponent(pageId)}/markdown`,
+      endpointKey: "pages-markdown-patch",
+      body,
+      isWrite: true,
+    });
+  }
+
+  async updateDataSource(
+    dataSourceId: string,
+    body: { properties: Record<string, Record<string, unknown>> },
+  ): Promise<NotionDataSource> {
+    return this.request({
+      method: "PATCH",
+      path: `/v1/data_sources/${encodeURIComponent(dataSourceId)}`,
+      endpointKey: "data-sources-update",
+      body,
+      isWrite: true,
+    });
+  }
 }
