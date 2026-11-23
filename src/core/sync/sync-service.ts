@@ -202,37 +202,45 @@ function formatDateRange(d: { start: string; end?: string | null } | null): stri
   return d.end ? `${d.start}..${d.end}` : d.start;
 }
 
-function formatFormulaValue(f: NotionFormulaValue): string {
+function formatFormulaValue(f: NotionFormulaValue | null | undefined): string {
+  if (!f) return "";
   switch (f.type) {
     case "string":
       return f.string ?? "";
     case "number":
-      return f.number === null ? "" : String(f.number);
+      return f.number === null || f.number === undefined ? "" : String(f.number);
     case "boolean":
-      return f.boolean === null ? "" : String(f.boolean);
+      return f.boolean === null || f.boolean === undefined ? "" : String(f.boolean);
     case "date":
       return formatDateRange(f.date);
-  }
-}
-
-function formatRollupValue(r: NotionRollupValue): string {
-  switch (r.type) {
-    case "number":
-      return r.number === null ? "" : String(r.number);
-    case "date":
-      return formatDateRange(r.date);
-    case "array":
-      return r.array
-        .map((item) => formatNotionPropertyValue(item))
-        .filter(Boolean)
-        .join(", ");
-    case "unsupported":
-    case "incomplete":
+    default:
       return "";
   }
 }
 
-export function formatNotionPropertyValue(raw: NotionPropertyValue | string): string {
+function formatRollupValue(r: NotionRollupValue | null | undefined): string {
+  if (!r) return "";
+  switch (r.type) {
+    case "number":
+      return r.number === null || r.number === undefined ? "" : String(r.number);
+    case "date":
+      return formatDateRange(r.date);
+    case "array":
+      return Array.isArray(r.array)
+        ? r.array
+            .map((item) => formatNotionPropertyValue(item))
+            .filter(Boolean)
+            .join(", ")
+        : "";
+    case "unsupported":
+    case "incomplete":
+    default:
+      return "";
+  }
+}
+
+export function formatNotionPropertyValue(raw: NotionPropertyValue | string | null | undefined): string {
+  if (raw === null || raw === undefined) return "";
   if (typeof raw === "string") return raw;
   switch (raw.type) {
     case "title":
@@ -244,9 +252,9 @@ export function formatNotionPropertyValue(raw: NotionPropertyValue | string): st
     case "select":
       return raw.select?.name ?? "";
     case "multi_select":
-      return raw.multi_select.map((o) => o.name).join(", ");
+      return (raw.multi_select ?? []).map((o) => o.name).join(", ");
     case "number":
-      return raw.number === null ? "" : String(raw.number);
+      return raw.number === null || raw.number === undefined ? "" : String(raw.number);
     case "checkbox":
       return raw.checkbox ? "true" : "false";
     case "url":
@@ -258,21 +266,44 @@ export function formatNotionPropertyValue(raw: NotionPropertyValue | string): st
     case "date":
       return formatDateRange(raw.date);
     case "relation":
-      return raw.relation.map((r) => r.id).join(", ");
+      return (raw.relation ?? []).map((r) => r.id).join(", ");
     case "formula":
       return formatFormulaValue(raw.formula);
     case "rollup":
       return formatRollupValue(raw.rollup);
     case "created_time":
-      return raw.created_time;
+      return raw.created_time ?? "";
     case "last_edited_time":
-      return raw.last_edited_time;
+      return raw.last_edited_time ?? "";
+    case "created_by":
+      return raw.created_by?.name ?? raw.created_by?.id ?? "";
+    case "last_edited_by":
+      return raw.last_edited_by?.name ?? raw.last_edited_by?.id ?? "";
+    case "people":
+      return (raw.people ?? []).map((u) => u.name ?? u.id).filter(Boolean).join(", ");
+    case "files":
+      return (raw.files ?? []).map((f) => f.name).filter(Boolean).join(", ");
+    case "unique_id": {
+      const uid = raw.unique_id;
+      if (!uid || uid.number === null || uid.number === undefined) return "";
+      return uid.prefix ? `${uid.prefix}-${uid.number}` : String(uid.number);
+    }
+    case "auto_increment_id": {
+      const aid = raw.auto_increment_id;
+      if (aid === null || aid === undefined) return "";
+      if (typeof aid === "number") return String(aid);
+      if (aid.number === null || aid.number === undefined) return "";
+      return aid.prefix ? `${aid.prefix}-${aid.number}` : String(aid.number);
+    }
+    case "button":
+      return "";
     case "verification":
       if (!raw.verification) return "";
       return raw.verification.date?.start
         ? `${raw.verification.state} (${raw.verification.date.start})`
         : raw.verification.state;
     case "unsupported":
+    default:
       return "";
   }
 }

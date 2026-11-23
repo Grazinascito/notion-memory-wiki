@@ -307,6 +307,18 @@ export interface NotionVerificationValue {
   date?: { start: string; end?: string | null } | null;
 }
 
+export interface NotionUserRef {
+  id: string;
+  name?: string;
+}
+
+export interface NotionFileRef {
+  name: string;
+  type?: "external" | "file";
+  external?: { url: string };
+  file?: { url: string };
+}
+
 export type NotionPropertyValue =
   | { id?: string; type: "title"; title: NotionRichText[] }
   | { id?: string; type: "rich_text"; rich_text: NotionRichText[] }
@@ -328,6 +340,13 @@ export type NotionPropertyValue =
   | { id?: string; type: "rollup"; rollup: NotionRollupValue }
   | { id?: string; type: "created_time"; created_time: string }
   | { id?: string; type: "last_edited_time"; last_edited_time: string }
+  | { id?: string; type: "created_by"; created_by: NotionUserRef | null }
+  | { id?: string; type: "last_edited_by"; last_edited_by: NotionUserRef | null }
+  | { id?: string; type: "people"; people: NotionUserRef[] }
+  | { id?: string; type: "files"; files: NotionFileRef[] }
+  | { id?: string; type: "unique_id"; unique_id: { prefix: string | null; number: number | null } | null }
+  | { id?: string; type: "auto_increment_id"; auto_increment_id?: { prefix?: string | null; number?: number | null } | number | null }
+  | { id?: string; type: "button"; button?: Record<string, unknown> }
   | { id?: string; type: "verification"; verification: NotionVerificationValue | null }
   | { id?: string; type: "unsupported" };
 

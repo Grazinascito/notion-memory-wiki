@@ -91,7 +91,19 @@ export class TokenProvider implements SecretStore {
       }
     }
 
-    // 3. Environment variable (headless/cron fallback)
+    // If an explicit token_ref was declared for this profile (e.g. a read_only integration token),
+    // fail closed immediately instead of silently falling back to process.env.NOTION_TOKEN.
+    if (options.tokenRef) {
+      throw new AxiError(
+        "TOKEN_MISSING",
+        `Explicit token_ref "${options.tokenRef}" for profile "${options.profile}" could not be resolved (refusing to fall back to NOTION_TOKEN).`,
+        [
+          `Populate "${options.tokenRef}" or remove token_ref from profile "${options.profile}" in ontology.yaml.`,
+        ],
+      );
+    }
+
+    // 3. Environment variable (headless/cron fallback when no explicit token_ref is configured)
     const envToken = process.env.NOTION_TOKEN?.trim();
     if (envToken) {
       return { token: envToken, source: "env" };

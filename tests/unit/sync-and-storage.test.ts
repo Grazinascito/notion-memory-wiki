@@ -8,7 +8,9 @@ import { OntologyEngine } from "../../src/core/ontology/ontology-engine.js";
 import { RenderService } from "../../src/core/ontology/render-service.js";
 import type { NotionGateway } from "../../src/core/ports.js";
 import { REDACTED_MARKER, ScopeGuard } from "../../src/core/scope/scope-guard.js";
-import { SyncService } from "../../src/core/sync/sync-service.js";
+import { formatNotionPropertyValue, SyncService } from "../../src/core/sync/sync-service.js";
+import { sanitizeNotionUris } from "../../src/shared/text.js";
+import type { NotionPropertyValue } from "../../src/shared/types.js";
 import { TokenProvider } from "../../src/infra/auth/token-provider.js";
 import { withAdvisoryLock } from "../../src/infra/fs/posix-fs.js";
 import { NotionHttpClient } from "../../src/infra/notion/notion-http-client.js";
@@ -758,6 +760,63 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
       assert.equal(state.last_reason, "public_api_space_request_rate_limit");
       assert.ok(state.retry_after_until > 0);
     } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("formats button, created_by, last_edited_by, people, files, unique_id, auto_increment_id, and unknown future property types safely", () => {
+    const samples: Array<[unknown, string]> = [
+      [{ type: "button", button: {} }, ""],
+      [{ type: "created_by", created_by: { id: "u1", name: "Grazi" } }, "Grazi"],
+      [{ type: "last_edited_by", last_edited_by: { id: "u2" } }, "u2"],
+      [{ type: "people", people: [{ id: "u1", name: "Ana" }, { id: "u2", name: "Bia" }] }, "Ana, Bia"],
+      [{ type: "files", files: [{ name: "spec.pdf" }] }, "spec.pdf"],
+      [{ type: "unique_id", unique_id: { prefix: "PRJ", number: 42 } }, "PRJ-42"],
+      [{ type: "auto_increment_id", auto_increment_id: 7 }, "7"],
+      [{ type: "future_unknown_notion_prop", value: 123 }, ""],
+      [{ type: "formula", formula: { type: "future_formula_type" } }, ""],
+      [{ type: "rollup", rollup: { type: "future_rollup_type" } }, ""],
+    ];
+
+    for (const [prop, expected] of samples) {
+      const formatted = formatNotionPropertyValue(prop as NotionPropertyValue);
+      assert.equal(typeof formatted, "string");
+      assert.equal(sanitizeNotionUris(formatted), expected);
+    }
+  });
+
+  it("fails closed when explicit token_ref is missing even if NOTION_TOKEN env var is exported", async () => {
+    const dir = await makeTempDir();
+    const prevEnv = process.env.NOTION_TOKEN;
+    try {
+      process.env.NOTION_TOKEN = "secret_read_write_env_token";
+      const provider = new TokenProvider(dir);
+
+      // Explicit file token_ref missing must NOT fall back to NOTION_TOKEN.
+      await assert.rejects(
+        () =>
+          provider.resolveToken({
+            profile: "reader_agent",
+            tokenRef: path.join(dir, "missing-readonly.token"),
+          }),
+        (err: unknown) => err instanceof AxiError && err.code === "TOKEN_MISSING",
+      );
+
+      // Explicit keychain token_ref missing must NOT fall back to NOTION_TOKEN.
+      await assert.rejects(
+        () =>
+          provider.resolveToken({
+            profile: "reader_agent",
+            tokenRef: "keychain:nmw/nonexistent-test-service-000000",
+          }),
+        (err: unknown) => err instanceof AxiError && err.code === "TOKEN_MISSING",
+      );
+    } finally {
+      if (prevEnv === undefined) {
+        delete process.env.NOTION_TOKEN;
+      } else {
+        process.env.NOTION_TOKEN = prevEnv;
+      }
       await fs.rm(dir, { recursive: true, force: true });
     }
   });
