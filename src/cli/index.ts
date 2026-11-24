@@ -12,6 +12,11 @@ import {
   formatSetupToon,
   formatSyncToon,
 } from "./toon.js";
+import {
+  handleApproveCommand,
+  handleSchemaCommand,
+  handleWriteCommand,
+} from "./write-commands.js";
 
 interface ParsedArgs {
   command: string;
@@ -38,6 +43,12 @@ function parseArgv(argv: string[]): ParsedArgs {
     "--offset",
     "--name",
     "--render-target",
+    "--set",
+    "--add",
+    "--remove",
+    "--clear",
+    "--md",
+    "--to",
   ]);
 
   for (let i = 1; i < args.length; i += 1) {
@@ -77,7 +88,7 @@ function firstFlag(parsed: ParsedArgs, name: string): string | undefined {
 function printHelp(): void {
   console.log(
     [
-      "Notion Memory Wiki CLI (Slice 1)",
+      "Notion Memory Wiki CLI (Slices 1 & 2)",
       "",
       "Commands:",
       "  wiki auth set [--profile <name>]                   Save Notion token into 0o600 token file",
@@ -88,6 +99,14 @@ function printHelp(): void {
       "  wiki catalog [--area <id>] [--profile <name>]      List permitted databases (Level 1a)",
       "  wiki query <alias> [--where K=V] [--fields a,b] [--follow <rel>] [--limit 20] [--profile <name>]",
       "  wiki read <page-id-url-or-alias> [--full] [--offset N] [--profile <name>]",
+      "  wiki write create <alias> --set K=V [--md \"...\"] [--propose-new-option] [--profile <name>]",
+      "  wiki write update <page-id> [--set K=V] [--add K=V] [--remove K=V] [--clear K] [--propose-new-option] [--profile <name>]",
+      "  wiki write append <page-id> --md \"...\" [--profile <name>]",
+      "  wiki write replace <page-id> --md \"...\" [--profile <name>]   (halted into proposal)",
+      "  wiki write trash <page-id> [--profile <name>]                (halted into proposal)",
+      "  wiki write move <page-id> --to <parent-id-or-alias>          (halted into proposal)",
+      "  wiki schema propose-option <alias> <property> <value>        (halted into proposal)",
+      "  wiki approve <proposal_id>                         Execute pending proposal after SHA-256 verification",
     ].join("\n"),
   );
 }
@@ -187,8 +206,38 @@ async function run(): Promise<void> {
       return;
     }
 
-    // All remaining commands require an initialized ontology.yaml and fail-closed profile resolution.
+    // All remaining commands require an initialized ontology.yaml.
     const ontology = await app.store.readOntology();
+
+    if (parsed.command === "approve") {
+      const proposalId = parsed.positionals[0];
+      if (!proposalId) {
+        throw new AxiError("INVALID_ARGUMENT", "Usage: wiki approve <proposal_id>");
+      }
+      if (parsed.booleans.has("--force")) {
+        throw new AxiError(
+          "INVALID_ARGUMENT",
+          "No --force bypass flag exists; approvals always verify live content hash and TTL.",
+        );
+      }
+      await handleApproveCommand({
+        app,
+        ontology,
+        proposalId,
+        envProfile,
+        cliProfile,
+        startedAt,
+        setActiveGateway: (gw) => {
+          activeGateway = gw;
+        },
+        setActiveProfile: (p) => {
+          activeProfile = p;
+        },
+      });
+      return;
+    }
+
+    // All non-approve commands require fail-closed profile resolution.
     const { profileName, scope } = app.scopeGuard.resolveProfile(
       ontology,
       envProfile,
@@ -358,6 +407,44 @@ async function run(): Promise<void> {
         http_status: 200,
         notion_calls: res.apiCalls,
         duration_ms: Date.now() - startedAt,
+      });
+      return;
+    }
+
+    if (parsed.command === "write") {
+      await handleWriteCommand({
+        app,
+        profileName,
+        tokenRef: scope.token_ref,
+        positionals: parsed.positionals,
+        flags: parsed.flags,
+        booleans: parsed.booleans,
+        startedAt,
+        setActiveGateway: (gw) => {
+          activeGateway = gw;
+        },
+        setResolvedVia: (via) => {
+          activeResolvedVia = via;
+        },
+      });
+      return;
+    }
+
+    if (parsed.command === "schema") {
+      await handleSchemaCommand({
+        app,
+        profileName,
+        tokenRef: scope.token_ref,
+        positionals: parsed.positionals,
+        flags: parsed.flags,
+        booleans: parsed.booleans,
+        startedAt,
+        setActiveGateway: (gw) => {
+          activeGateway = gw;
+        },
+        setResolvedVia: (via) => {
+          activeResolvedVia = via;
+        },
       });
       return;
     }

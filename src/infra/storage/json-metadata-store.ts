@@ -17,6 +17,7 @@ import type {
   CacheSnapshot,
   FractalPointers,
   OntologyConfig,
+  ProposalRecord,
 } from "../../shared/types.js";
 import {
   atomicWriteFile,
@@ -24,6 +25,8 @@ import {
   expandUserPath,
   withAdvisoryLock,
 } from "../fs/posix-fs.js";
+
+const VALID_PROPOSAL_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -311,5 +314,51 @@ export class JsonMetadataStore implements MetadataStore {
     } catch {
       return false;
     }
+  }
+
+  private assertValidProposalId(proposalId: string): void {
+    if (!VALID_PROPOSAL_ID_RE.test(proposalId)) {
+      throw new AxiError(
+        "INVALID_ARGUMENT",
+        `Invalid proposal_id "${proposalId}". Expected 1-64 alphanumeric, "_" or "-" characters.`,
+      );
+    }
+  }
+
+  private proposalPath(proposalId: string): string {
+    this.assertValidProposalId(proposalId);
+    return path.join(this.wikiHome, "proposals", `${proposalId}.json`);
+  }
+
+  async writeProposal(proposal: ProposalRecord): Promise<void> {
+    const proposalsDir = path.join(this.wikiHome, "proposals");
+    await ensureSecureDir(proposalsDir);
+    const targetPath = this.proposalPath(proposal.proposal_id);
+    await atomicWriteFile(
+      targetPath,
+      `${JSON.stringify(proposal, null, 2)}\n`,
+      0o600,
+    );
+  }
+
+  async readProposal(proposalId: string): Promise<ProposalRecord> {
+    const targetPath = this.proposalPath(proposalId);
+    try {
+      const raw = await fs.readFile(targetPath, "utf8");
+      return JSON.parse(raw) as ProposalRecord;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new AxiError(
+          "NOT_FOUND",
+          `Proposal "${proposalId}" not found in ${path.join(this.wikiHome, "proposals")}.`,
+        );
+      }
+      throw err;
+    }
+  }
+
+  async withProposalLock<T>(proposalId: string, fn: () => Promise<T>): Promise<T> {
+    this.assertValidProposalId(proposalId);
+    return withAdvisoryLock(this.wikiHome, `proposal-${proposalId}`, fn);
   }
 }

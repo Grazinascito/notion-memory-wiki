@@ -25,6 +25,35 @@ async function makeTempDir(): Promise<string> {
   return fs.mkdtemp(path.join(os.tmpdir(), "nmw-test-"));
 }
 
+const UNEXPECTED_WRITE_STUBS: Pick<
+  NotionGateway,
+  | "createPage"
+  | "updatePageProperties"
+  | "trashPage"
+  | "movePage"
+  | "patchPageMarkdown"
+  | "updateDataSource"
+> = {
+  createPage: async () => {
+    throw new Error("unexpected createPage in read test");
+  },
+  updatePageProperties: async () => {
+    throw new Error("unexpected updatePageProperties in read test");
+  },
+  trashPage: async () => {
+    throw new Error("unexpected trashPage in read test");
+  },
+  movePage: async () => {
+    throw new Error("unexpected movePage in read test");
+  },
+  patchPageMarkdown: async () => {
+    throw new Error("unexpected patchPageMarkdown in read test");
+  },
+  updateDataSource: async () => {
+    throw new Error("unexpected updateDataSource in read test");
+  },
+};
+
 describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
   it("preserves user YAML comments on patchOntology via CST parseDocument", async () => {
     const dir = await makeTempDir();
@@ -103,6 +132,7 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
 
       let calls = 0;
       const fakeNotion: NotionGateway = {
+        ...UNEXPECTED_WRITE_STUBS,
         getCallCount: () => calls,
         getMe: async () => {
           calls += 1;
@@ -131,6 +161,10 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
               Name: { type: "title", title: [{ plain_text: "Project Alpha" }] },
             },
           };
+        },
+        listPagePropertyItems: async () => {
+          calls += 1;
+          return { object: "list", results: [], has_more: false, next_cursor: null };
         },
         getDataSource: async (id) => {
           calls += 1;
@@ -584,6 +618,7 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
 
       let calls = 0;
       const fakeNotion: NotionGateway = {
+        ...UNEXPECTED_WRITE_STUBS,
         getCallCount: () => calls,
         getMe: async () => {
           calls += 1;
@@ -619,6 +654,10 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
             last_edited_time: "2026-11-23T00:00:00.000Z",
             properties: {},
           };
+        },
+        listPagePropertyItems: async () => {
+          calls += 1;
+          return { object: "list", results: [], has_more: false, next_cursor: null };
         },
         getDataSource: async (id) => {
           calls += 1;
@@ -832,6 +871,41 @@ describe("JsonMetadataStore + SyncService + NotionHttpClient", () => {
       } else {
         process.env.NOTION_TOKEN = prevEnv;
       }
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("requests GET /v1/pages/:pageId/properties/:propertyId?page_size=100 in NotionHttpClient.listPagePropertyItems", async () => {
+    const dir = await makeTempDir();
+    try {
+      const limiter = new CrossProcessRateLimiter({ wikiHome: dir });
+      const requestedUrls: Array<{ url: string; method: string }> = [];
+      const client = new NotionHttpClient({
+        token: "test_token_000",
+        rateLimiter: limiter,
+        fetchFn: async (input, init) => {
+          requestedUrls.push({ url: String(input), method: init?.method ?? "GET" });
+          return new Response(
+            JSON.stringify({
+              object: "list",
+              results: [{ object: "property_item", type: "relation", relation: { id: "rel-1" } }],
+              has_more: false,
+              next_cursor: null,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        },
+      });
+
+      const res = await client.listPagePropertyItems("page-123", "prop-abc", "cur-2");
+      assert.equal(res.results.length, 1);
+      assert.equal(requestedUrls.length, 1);
+      assert.equal(requestedUrls[0]!.method, "GET");
+      assert.equal(
+        requestedUrls[0]!.url,
+        "https://api.notion.com/v1/pages/page-123/properties/prop-abc?page_size=100&start_cursor=cur-2",
+      );
+    } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
   });

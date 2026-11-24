@@ -355,9 +355,17 @@ export interface NotionPage {
   id: string;
   url?: string;
   parent: NotionParent;
+  created_time?: string;
   last_edited_time: string;
   in_trash?: boolean;
   properties: Record<string, NotionPropertyValue>;
+}
+
+export interface NotionPagePropertyItem {
+  object?: "property_item";
+  id?: string;
+  type: string;
+  relation?: { id: string };
 }
 
 export interface NotionBlock {
@@ -392,4 +400,66 @@ export interface NotionListResponse<T> {
   results: T[];
   has_more: boolean;
   next_cursor: string | null;
+}
+
+// --- Slice 2: Safe writes & approval proposals ---
+
+export type ProposalCategory = "destructive" | "schema";
+
+export type ProposalActionType =
+  | "update_properties"
+  | "trash_page"
+  | "move_page"
+  | "replace_markdown"
+  | "schema_add_option";
+
+export type ProposalStatus = "pending" | "applied" | "expired";
+
+export type ProposalPayload =
+  | {
+      kind: "update_properties";
+      page_id: string;
+      properties: Record<string, Record<string, unknown>>;
+    }
+  | {
+      kind: "trash_page";
+      page_id: string;
+    }
+  | {
+      kind: "move_page";
+      page_id: string;
+      parent:
+        | { type: "page_id"; page_id: string }
+        | { type: "data_source_id"; data_source_id: string };
+    }
+  | {
+      kind: "replace_markdown";
+      page_id: string;
+      new_str: string;
+      allow_deleting_content: boolean;
+    }
+  | {
+      kind: "schema_add_option";
+      data_source_id: string;
+      property_name: string;
+      property_type: "select" | "multi_select";
+      new_option: string;
+      all_options: Array<{ id?: string; name: string; color?: string }>;
+    };
+
+export interface ProposalRecord {
+  proposal_id: string;
+  category: ProposalCategory;
+  created_at: string;
+  expires_at: string;
+  profile: string;
+  action_type: ProposalActionType;
+  target_id: string;
+  target_alias: string | null;
+  expected_content_hash: string;
+  expected_last_edited_time: string;
+  summary: string;
+  diff: string;
+  payload: ProposalPayload;
+  status: ProposalStatus;
 }

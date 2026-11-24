@@ -7,12 +7,15 @@ import type {
   RateLimiter,
   SecretStore,
 } from "../core/ports.js";
+import { ApprovalGate } from "../core/approval/approval-gate.js";
 import { OntologyEngine } from "../core/ontology/ontology-engine.js";
 import { RenderService } from "../core/ontology/render-service.js";
 import { QueryService } from "../core/query/query-service.js";
 import { ScopeGuard } from "../core/scope/scope-guard.js";
 import { SetupService } from "../core/sync/setup-service.js";
 import { SyncService } from "../core/sync/sync-service.js";
+import { WriteValidator } from "../core/validation/write-validator.js";
+import { WriteService } from "../core/write/write-service.js";
 import { TokenProvider } from "../infra/auth/token-provider.js";
 import { JsonlMetricsLogger } from "../infra/metrics/jsonl-metrics-logger.js";
 import { NotionHttpClient } from "../infra/notion/notion-http-client.js";
@@ -32,6 +35,7 @@ export interface AppContainer {
   createSetupService(tokenOrGateway: string | NotionGateway): SetupService;
   createSyncService(tokenOrGateway: string | NotionGateway): SyncService;
   createQueryService(tokenOrGateway: string | NotionGateway): QueryService;
+  createWriteService(tokenOrGateway: string | NotionGateway): WriteService;
 }
 
 export function resolveWikiHome(): string {
@@ -68,6 +72,13 @@ export function bootstrapApp(wikiHome = resolveWikiHome()): AppContainer {
   const createQueryService = (tokenOrGateway: string | NotionGateway): QueryService =>
     new QueryService(asGateway(tokenOrGateway), store, scopeGuard, ontologyEngine);
 
+  const createWriteService = (tokenOrGateway: string | NotionGateway): WriteService => {
+    const gateway = asGateway(tokenOrGateway);
+    const validator = new WriteValidator(gateway, store, scopeGuard);
+    const gate = new ApprovalGate(gateway, store);
+    return new WriteService(gateway, store, scopeGuard, ontologyEngine, validator, gate);
+  };
+
   return {
     wikiHome,
     store,
@@ -81,5 +92,6 @@ export function bootstrapApp(wikiHome = resolveWikiHome()): AppContainer {
     createSetupService,
     createSyncService,
     createQueryService,
+    createWriteService,
   };
 }

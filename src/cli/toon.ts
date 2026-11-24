@@ -1,7 +1,16 @@
+import crypto from "node:crypto";
+import type { ApprovalExecutionResult } from "../core/approval/approval-gate.js";
 import type { CatalogEntry } from "../core/ontology/ontology-engine.js";
 import type { QueryDatabaseResult, ReadPageResult } from "../core/query/query-service.js";
 import type { SetupDiscoveryResult } from "../core/sync/setup-service.js";
 import type { SyncResult } from "../core/sync/sync-service.js";
+import type {
+  AppendMarkdownResult,
+  CreateRecordResult,
+  ProposalCreatedResult,
+  UpdateRecordResult,
+} from "../core/write/write-service.js";
+import { sanitizeNotionUris, wrapUntrustedContent } from "../shared/text.js";
 
 /**
  * Compact TOON (Token-Oriented Object Notation) formatters for AXI CLI output.
@@ -67,4 +76,48 @@ export function formatSyncToon(res: SyncResult): string {
     lines.push(`  warn: ${warn}`);
   }
   return lines.join("\n");
+}
+
+export function formatCreateToon(res: CreateRecordResult): string {
+  return `write create ok id=${res.pageId} alias=${res.alias} via=${res.resolvedVia}${res.recoveredFromAmbiguous ? " recovered=true" : ""} calls=${res.apiCalls}`;
+}
+
+export function formatProposalToon(res: ProposalCreatedResult, reasons: string[] = []): string {
+  const p = res.proposal;
+  const nonce = crypto.randomBytes(8).toString("hex");
+  const sanitizedBlock = sanitizeNotionUris(
+    [`summary: ${p.summary}`, "diff:", p.diff].join("\n"),
+  );
+  const lines = [
+    `PROPOSAL_REQUIRED proposal_id=${p.proposal_id} category=${p.category} action=${p.action_type} expires=${p.expires_at} calls=${res.apiCalls}`,
+    ...(reasons.length > 0
+      ? [`  reasons: ${reasons.map((r) => sanitizeNotionUris(r)).join("; ")}`]
+      : []),
+    wrapUntrustedContent(sanitizedBlock, nonce),
+    `  approve: run \`wiki approve ${p.proposal_id}\` in your terminal`,
+  ];
+  return lines.join("\n");
+}
+
+export function formatUpdateToon(res: UpdateRecordResult): string {
+  if (res.applied) {
+    return `write update ok id=${res.pageId} alias=${res.alias} fields=${res.updatedFields.join(",")} calls=${res.apiCalls}`;
+  }
+  return formatProposalToon(
+    { proposal: res.proposal, apiCalls: res.apiCalls },
+    res.reasons,
+  );
+}
+
+export function formatAppendToon(res: AppendMarkdownResult): string {
+  return `write append ok id=${res.pageId} chars=${res.appendedChars} calls=${res.apiCalls}`;
+}
+
+export function formatApproveToon(res: ApprovalExecutionResult): string {
+  const nonce = crypto.randomBytes(8).toString("hex");
+  const wrappedSummary = wrapUntrustedContent(
+    sanitizeNotionUris(`summary: ${res.summary}`),
+    nonce,
+  );
+  return `approve ok proposal_id=${res.proposalId} category=${res.category} action=${res.actionType} target=${res.targetId}\n${wrappedSummary}`;
 }
